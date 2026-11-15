@@ -767,7 +767,7 @@ class Game {
     player.vy = JUMP_VY;
     player.grounded = false;
     player.jumpBlockedUntil = now + JUMP_COOLDOWN_MS;
-    this.pushEvent({ k: 'jump', id });
+    this.pushEvent({ k: 'jump', id, x: round2(player.x), z: round2(player.z) });
   }
 
   /**
@@ -954,27 +954,31 @@ class Game {
       if (other.spawnProtectUntil > now) continue;
       const height = bodyHeight(other);
       const top = other.y + height;
+      const headBottom = Math.max(other.y, top - HEAD_HEIGHT);
       const tBody = rayAABB(
         origin.x, origin.y, origin.z,
         dir.x, dir.y, dir.z,
         other.x - PLAYER_RADIUS, other.y, other.z - PLAYER_RADIUS,
-        other.x + PLAYER_RADIUS, top, other.z + PLAYER_RADIUS,
+        other.x + PLAYER_RADIUS, headBottom, other.z + PLAYER_RADIUS,
         bestDist,
       );
       const tHead = rayAABB(
         origin.x, origin.y, origin.z,
         dir.x, dir.y, dir.z,
-        other.x - HEAD_RADIUS, top - HEAD_HEIGHT, other.z - HEAD_RADIUS,
+        other.x - HEAD_RADIUS, headBottom, other.z - HEAD_RADIUS,
         other.x + HEAD_RADIUS, top, other.z + HEAD_RADIUS,
         bestDist,
       );
       let t = null;
+      let hitIsHead = false;
       if (tBody !== null) t = tBody;
-      if (tHead !== null && (t === null || tHead < t)) t = tHead;
+      if (tHead !== null && (t === null || tHead < t)) {
+        t = tHead;
+        hitIsHead = true;
+      }
       if (t !== null && t < bestDist) {
-        // 머리 판정은 "머리 볼륨(상단 0.42m, 반지름 0.26m)을 지나면서 벽보다 가까운가"로 한다.
-        // 머리 박스가 몸통 박스 안에 있으므로 몸통 진입점이 아니라 머리 통과 거리를 기준으로 본다.
-        headshot = tHead !== null && tHead < bestDist;
+        // 몸통과 머리를 겹치지 않는 볼륨으로 검사하고, 실제 가장 가까운 볼륨으로 판정한다.
+        headshot = hitIsHead;
         bestDist = t;
         hitPlayerId = other.id;
       }
@@ -1177,6 +1181,7 @@ class Game {
     this.round.nextRoundAt = 0;
     this.round.startedWith = this.players.size;
     this.resetZone(now);
+    for (const item of this.items) item.readyAt = 0;
     for (const player of this.players.values()) {
       player.kills = 0;
       player.deaths = 0;

@@ -84,6 +84,27 @@ function waitFor(predicate, { timeout = 8000, interval = 100, message = '조건 
   });
 }
 
+function findClearYaw(player, map, distance = 5) {
+  for (let i = 0; i < 16; i += 1) {
+    const yaw = (i * Math.PI * 2) / 16;
+    let clear = true;
+    for (let t = 0.25; t <= distance; t += 0.25) {
+      const x = player.x - Math.sin(yaw) * t;
+      const z = player.z - Math.cos(yaw) * t;
+      if (Math.abs(x) > map.arena.half - 0.75 || Math.abs(z) > map.arena.half - 0.75) {
+        clear = false;
+        break;
+      }
+      if (map.covers.some((cover) => Math.abs(x - cover.x) <= cover.w / 2 + 0.55 && Math.abs(z - cover.z) <= cover.d / 2 + 0.55)) {
+        clear = false;
+        break;
+      }
+    }
+    if (clear) return yaw;
+  }
+  return null;
+}
+
 function getJSON(url) {
   return new Promise((resolve, reject) => {
     const req = http.get(url, (res) => {
@@ -593,6 +614,7 @@ class Bot {
       alive: entry[8] === 1,
       weapon: entry[9],
       mag: entry[10],
+      reserve: entry[11],
       kills: entry[12],
       kits: entry[16],
     }));
@@ -809,7 +831,7 @@ async function main() {
 
     await step('부트: WebGL 렌더러가 초기화되고 모듈이 로드된다', async () => {
       await page.navigate(`${BASE}/`);
-      await waitFor(() => page.eval('window.__3dfpBooted === true'), { message: '__3dfpBooted 가 true 가 되지 않았다' });
+      await waitFor(() => page.eval('window.__3dfpBooted === true'), { timeout: 15000, message: '__3dfpBooted 가 15초 안에 true 가 되지 않았다' });
       const webgl = await page.eval(`(() => {
         const canvas = document.getElementById('game');
         const gl = canvas.getContext('webgl2') || canvas.getContext('webgl');
@@ -826,7 +848,8 @@ async function main() {
       assert(webgl.ok, 'WebGL 컨텍스트가 없다');
       assert(webgl.width > 300 && webgl.height > 200, `캔버스 크기가 이상하다: ${webgl.width}x${webgl.height}`);
       console.log(`      · ${webgl.version} / ${webgl.renderer}`);
-      assert(!(await page.visible('#boot-error')), '부트 오류 배너가 떠 있다');
+      const bootErrorVisible = await page.visible('#boot-error');
+      assert(!bootErrorVisible, `부트 오류 배너가 떠 있다: ${await page.text('#boot-error-text')}`);
     });
 
     await step('메뉴: 온보딩(닉네임·방 코드·조작법 7동작)이 한 화면에 있다', async () => {
@@ -906,18 +929,35 @@ async function main() {
     });
 
     await step('PC 이동: W 키로 실제 위치가 바뀐다(서버 스냅샷 확인)', async () => {
-      await waitFor(() => bot.find('치즈'), { message: '봇이 치즈의 스냅샷을 못 봤다' });
+      await waitFor(() => {
+        const me = bot.find('치즈');
+        return me && me.alive && bot.round()?.state === 'live';
+      }, { message: '생존 중인 치즈의 스냅샷을 못 봤다' });
+      assert(!(await page.visible('#pause')), '일시정지 중이라 이동할 수 없다');
       const before = bot.find('치즈');
+      const map = await getJSON(`${BASE}/api/map`);
+      const yaw = findClearYaw(before, map, 8);
+      assert(yaw !== null, '플레이어 주변에 열린 이동 경로가 없다');
+      const yawDiff = (a, b) => Math.abs(((a - b + Math.PI * 3) % (Math.PI * 2)) - Math.PI);
+      let aimed = false;
+      for (let i = 0; i < 5 && !aimed; i += 1) {
+        await page.lookTo(yaw, 0);
+        await sleep(60);
+        aimed = yawDiff((await page.debug()).yaw, yaw) < 0.03;
+      }
+      assert(aimed, '열린 이동 방향이 클라이언트 시점에 적용되지 않았다');
       await page.key('KeyW', 'keyDown');
-      await sleep(600);
-      await page.key('KeyW', 'keyUp');
-      await waitFor(
-        () => {
-          const now = bot.find('치즈');
-          return now && Math.hypot(now.x - before.x, now.z - before.z) > 0.5;
-        },
-        { message: 'W 키로 이동한 거리가 0.5m 미만이다' },
-      );
+      try {
+        await waitFor(
+          () => {
+            const now = bot.find('치즈');
+            return now && Math.hypot(now.x - before.x, now.z - before.z) > 0.5;
+          },
+          { timeout: 3000, message: 'W 키로 이동한 거리가 0.5m 미만이다' },
+        );
+      } finally {
+        await page.key('KeyW', 'keyUp');
+      }
     });
 
     await step('PC 시점: 마우스 이동(movementX)으로 yaw가 바뀐다', async () => {
@@ -986,17 +1026,72 @@ async function main() {
       // 봇은 커버에 가로막히지 않는 사거리 자리를 찾아 이동한 뒤 조준 사격한다.
       await bot.goFiringRange('치즈', 5);
       const myId = bot.find('치즈').id;
-      const hp0 = bot.find('치즈').hp;
-      for (let attempt = 0; attempt < 16; attempt += 1) {
+      const damageMark = bot.events.length;
+      let hit = false;
+      for (let attempt = 0; attempt < 16 && !hit; attempt += 1) {
         bot.shootAt(myId, { shots: 1 });
-        await sleep(220);
-        if (bot.find('치즈').hp < hp0) break;
+        hit = await waitFor(
+          () => bot.events.slice(damageMark).some((event) => event.k === 'hit' && event.id === myId),
+          { timeout: 600, interval: 50, message: '이번 사격이 아직 명중하지 않았다' },
+        ).then(() => true).catch(() => false);
       }
-      await waitFor(() => bot.find('치즈').hp < 100, { timeout: 8000, message: '봇의 사격이 한 발도 명중하지 않았다' });
-      const hpBefore = bot.find('치즈').hp;
+      assert(hit, '봇의 사격이 한 발도 명중하지 않았다');
+      await waitFor(
+        () => {
+          const player = bot.find('치즈');
+          return player && player.hp < 100 ? player : false;
+        },
+        { timeout: 3000, message: '피격이 서버 스냅샷에 반영되지 않았다' },
+      );
+
+      // A timeout retry may have one or more shots still in flight. Let HP settle before the baseline.
+      let lastTick = -1;
+      let settledHp = null;
+      let settledKits = null;
+      let stableSnapshots = 0;
+      const damageSettled = await waitFor(
+        () => {
+          const tick = bot.snap?.tick;
+          const player = bot.find('치즈');
+          if (!player || !player.alive || !Number.isInteger(tick) || tick === lastTick) return false;
+          lastTick = tick;
+          if (player.hp === settledHp && player.kits === settledKits) stableSnapshots += 1;
+          else {
+            settledHp = player.hp;
+            settledKits = player.kits;
+            stableSnapshots = 0;
+          }
+          return stableSnapshots >= 2 ? player : false;
+        },
+        { timeout: 3000, interval: 50, message: '피격이 끝난 뒤 HP/키트 스냅샷이 안정되지 않았다' },
+      );
+      assert(damageSettled.alive, '힐 테스트 전에 플레이어가 탈락했다');
+      const hpBefore = damageSettled.hp;
+      const kitsBefore = damageSettled.kits;
+      assert(kitsBefore > 0, '힐 테스트 전에 사용 가능한 키트가 없다');
+
+      const healMark = bot.events.length;
       await page.press('KeyQ', 80);
-      await waitFor(() => bot.find('치즈').hp > hpBefore, { timeout: 3000, message: '힐 키트로 회복되지 않았다' });
-      assert(bot.find('치즈').kits < 2, '힐 키트 수가 줄지 않았다');
+      const healEvent = await waitFor(
+        () => bot.events.slice(healMark).find((event) => event.k === 'heal' && event.id === myId) || false,
+        { timeout: 3000, message: '힐 키트 회복 이벤트가 서버에서 오지 않았다' },
+      );
+      assert(healEvent.hp > hpBefore, `회복 이벤트의 HP가 증가하지 않았다(before=${hpBefore}, event=${healEvent.hp})`);
+      assert(healEvent.kits === kitsBefore - 1, `회복 이벤트에서 키트가 1개 줄지 않았다(before=${kitsBefore}, event=${healEvent.kits})`);
+
+      let lastHealSnapshot = null;
+      const healedSnapshot = await waitFor(
+        () => {
+          const player = bot.find('치즈');
+          lastHealSnapshot = player ? { hp: player.hp, kits: player.kits, tick: bot.snap?.tick } : null;
+          return player && player.hp === healEvent.hp && player.kits === healEvent.kits ? player : false;
+        },
+        {
+          timeout: 3000,
+          message: `회복 이벤트 값이 서버 스냅샷에 반영되지 않았다(event=${healEvent.hp}/${healEvent.kits}, snapshot=${JSON.stringify(lastHealSnapshot)})`,
+        },
+      );
+      assert(healedSnapshot.hp > hpBefore && healedSnapshot.kits === kitsBefore - 1, '회복된 HP 또는 키트 감소가 최종 스냅샷에 없다');
       await page.shot('05-combat');
     });
 
@@ -1128,6 +1223,7 @@ async function main() {
     });
 
     await step('앉기·달리기: 자세가 서버에 전달된다(C→플래그, Shift→속도)', async () => {
+      assert(!(await page.visible('#pause')), '이전 라운드에서 남은 일시정지 화면이 다시 열렸다');
       await page.key('KeyC', 'keyDown');
       await sleep(300);
       const dbg = await page.debug();
@@ -1148,68 +1244,232 @@ async function main() {
         },
         { timeout: 2500, message: '앉기 해제가 반영되지 않았다' },
       );
+
+      const meNow = bot.find('치즈');
+      const map = await getJSON(`${BASE}/api/map`);
+      const openYaw = findClearYaw(meNow, map, 8);
+      assert(openYaw !== null, '달리기 검증을 위한 열린 경로가 없다');
+      await page.lookTo(openYaw, 0); // 같은 열린 방향에서 걷기와 달리기 속도를 비교한다.
+      const walkStart = bot.find('치즈');
+      await page.key('KeyW', 'keyDown');
+      await sleep(450);
+      await page.key('KeyW', 'keyUp');
+      const walkEnd = bot.find('치즈');
+      const walkDistance = Math.hypot(walkEnd.x - walkStart.x, walkEnd.z - walkStart.z);
+
+      const sprintStart = bot.find('치즈');
+      await page.key('ShiftLeft', 'keyDown');
+      await page.key('KeyW', 'keyDown');
+      await waitFor(() => {
+        const me = bot.find('치즈');
+        return me && (me.flags & 8) !== 0;
+      }, { timeout: 2500, message: '달리기 상태가 서버 스냅샷에 없다' });
+      await sleep(450);
+      await page.key('KeyW', 'keyUp');
+      await page.key('ShiftLeft', 'keyUp');
+      await waitFor(() => {
+        const me = bot.find('치즈');
+        return me && (me.flags & 8) === 0;
+      }, { timeout: 2500, message: '달리기 해제가 반영되지 않았다' });
+      const sprintEnd = bot.find('치즈');
+      const sprintDistance = Math.hypot(sprintEnd.x - sprintStart.x, sprintEnd.z - sprintStart.z);
+      assert(sprintDistance > walkDistance * 1.12, `Shift 달리기 속도가 걷기보다 빠르지 않다(${walkDistance.toFixed(2)}m → ${sprintDistance.toFixed(2)}m)`);
     });
 
-    await step('보급 루팅: 아이템으로 걸어가 F 로 줍고 토스트가 뜬다', async () => {
-      const items = (await page.debug()).loot;
-      const me = bot.find('치즈');
-      // 가장 가까운 '힐 키트' 또는 '탄약' 아이템을 고른다.
-      const targets = items
-        .filter((it) => it.kind === 'kit' || it.kind === 'ammo' || it.kind === 'medkit')
-        .map((it) => ({ ...it, d: Math.hypot(it.x - me.x, it.z - me.z) }))
-        .sort((a, b) => a.d - b.d);
-      assert(targets.length > 0, '보급 아이템이 없다');
-      const target = targets[0];
-      const kitsBefore = (await page.debug()).kits;
-      const reserveBefore = bot.find('치즈').mag;
+    await step('보급 루팅: 가까운 유효 아이템까지 달려가 F 로 줍는다', async () => {
+      let me = bot.find('치즈');
+      assert(me && me.alive, '보급 테스트 전에 생존 상태가 아니다');
 
-      // 걸어가기: 목표 방향으로 yaw 를 돌리고 W 를 누른다.
-      const started = Date.now();
-      await page.key('KeyW', 'keyDown');
-      while (Date.now() - started < 20000) {
-        const now = bot.find('치즈');
-        if (!now) break;
-        const dist = Math.hypot(target.x - now.x, target.z - now.z);
-        if (dist < 1.8) break;
-        await page.lookTo(Math.atan2(-(target.x - now.x), -(target.z - now.z)), 0);
-        await sleep(120);
+      // 이 라운드에서 탄약과 구급상자를 실제로 쓸 수 있게 만든다.
+      if (me.hp >= 100) {
+        await bot.goFiringRange('치즈', 5);
+        const myId = bot.find('치즈').id;
+        const damageMark = bot.events.length;
+        let hit = false;
+        for (let attempt = 0; attempt < 16 && !hit; attempt += 1) {
+          bot.shootAt(myId, { shots: 1 });
+          hit = await waitFor(
+            () => bot.events.slice(damageMark).some((event) => event.k === 'hit' && event.id === myId),
+            { timeout: 600, interval: 50, message: '이번 사격이 아직 명중하지 않았다' },
+          ).then(() => true).catch(() => false);
+        }
+        assert(hit, '구급상자를 쓸 수 있도록 체력을 깎지 못했다');
+        await waitFor(() => {
+          const current = bot.find('치즈');
+          return current && current.hp < 100;
+        }, { timeout: 3000, message: '피격이 서버 스냅샷에 반영되지 않았다' });
       }
-      await page.key('KeyW', 'keyUp');
-      const arrived = bot.find('치즈');
-      const dist = Math.hypot(target.x - arrived.x, target.z - arrived.z);
-      assert(dist < 3.2, `보급 아이템에 도착하지 못했다(거리 ${dist.toFixed(1)}m)`);
-      await page.press('KeyF', 80);
-      const picked = await waitFor(
-        async () => {
-          const d = await page.debug();
-          const meNow = bot.find('치즈');
-          const kitUp = d.kits > kitsBefore;
-          const ammoUp = meNow && meNow.hp > 0 && false;
-          return kitUp || d.lootOpen === false || ammoUp ? d : false;
-        },
-        { timeout: 4000, message: '줍기 효과가 서버에 반영되지 않았다' },
-      ).catch(() => null);
+
+      me = bot.find('치즈');
+      if (me.weapon === 1 && me.reserve >= 150 && me.mag === 30) {
+        const shotsBefore = bot.events.filter((event) => event.k === 'shot' && event.id === me.id).length;
+        await page.mouseDown();
+        await sleep(120);
+        await page.mouseUp();
+        await waitFor(
+          () => bot.events.filter((event) => event.k === 'shot' && event.id === me.id).length > shotsBefore,
+          { timeout: 3000, message: '탄약 테스트용 발사가 되지 않았다' },
+        );
+        await waitFor(() => bot.find('치즈').mag < 30, { message: '탄창이 줄지 않았다' });
+        await sleep(250);
+        await page.press('KeyR', 80);
+        await waitFor(
+          () => {
+            const current = bot.find('치즈');
+            return current && current.mag === 30 && current.reserve < 150;
+          },
+          { timeout: 5000, message: '탄약 여유를 만들기 위한 재장전이 끝나지 않았다' },
+        );
+      }
+
+      const debug = await page.debug();
+      me = bot.find('치즈');
+      const usableItems = debug.loot.filter((item) => {
+        if (item.kind === 'kit') return debug.kits < 4;
+        if (item.kind === 'weapon') return !debug.owned[item.weapon];
+        if (item.kind === 'medkit') return me.hp < 100;
+        if (item.kind === 'ammo') return me.weapon === 1 && me.reserve < 150;
+        return false;
+      });
+      const map = await getJSON(`${BASE}/api/map`);
+      const boxes = coverBoxes(map);
+      const walkGrid = buildGrid(boxes);
+      const findRoute = (item, from) => {
+        let best = null;
+        for (let i = 0; i < 16; i += 1) {
+          const angle = (Math.PI * 2 * i) / 16;
+          const approach = { x: item.x + Math.cos(angle) * 1.8, z: item.z + Math.sin(angle) * 1.8 };
+          if (pointBlocked(boxes, approach.x, approach.z, 0.6)) continue;
+          const cell = cellOf(approach.x) + cellOf(approach.z) * GRID_N;
+          if (walkGrid[cell]) continue;
+          const route = findPath(walkGrid, from, approach);
+          if (route === null) continue;
+          route.push(approach);
+          if (!best || route.length < best.route.length) best = { route, approach };
+        }
+        return best;
+      };
+      const availableIds = () => new Set((bot.snap?.items || []).filter(([, ready]) => ready).map(([id]) => id));
+      const targetsFrom = (from) => {
+        const available = availableIds();
+        return usableItems
+          .filter((item) => available.has(item.id))
+          .map((item) => ({ ...item, path: findRoute(item, from) }))
+          .filter((item) => item.path)
+          .sort((a, b) => a.path.route.length - b.path.route.length);
+      };
+      const initialTargets = targetsFrom(me);
+      assert(initialTargets.length > 0, '가까이 접근할 수 있는 활성 보급품이 없다');
+
+      // 보급은 다른 플레이어가 먼저 가져갈 수 있다. 이동 중 ready 상태를 확인해 다음 아이템으로 재경로한다.
+      const started = Date.now();
+      const lootRouteMark = bot.events.length;
+      let target = null;
+      let routeIndex = 0;
+      let finalDistance = Infinity;
+      let picked = false;
+      let attempts = 0;
+      while (Date.now() - started < 90000 && attempts < 12 && !picked) {
+        const currentToast = await page.text('#toast');
+        if (/보급 획득/.test(currentToast)) {
+          picked = true;
+          break;
+        }
+        me = bot.find('치즈');
+        if (!me || !me.alive) break;
+        const candidates = targetsFrom(me);
+        if (!candidates.length) {
+          await sleep(100);
+          continue;
+        }
+        target = candidates[0];
+        const route = target.path.route;
+        routeIndex = 0;
+        await page.key('ShiftLeft', 'keyDown');
+        await page.key('KeyW', 'keyDown');
+        try {
+          await waitFor(
+            () => {
+              const current = bot.find('치즈');
+              return current && (current.flags & 8) !== 0;
+            },
+            { timeout: 2500, message: '루팅 경로 달리기 상태가 서버에 전달되지 않았다' },
+          );
+          while (Date.now() - started < 90000) {
+            const now = bot.find('치즈');
+            if (!now || !now.alive || !availableIds().has(target.id)) break;
+            const distance = Math.hypot(target.x - now.x, target.z - now.z);
+            if (distance < 2.0) break;
+            while (routeIndex < route.length - 1 && Math.hypot(route[routeIndex].x - now.x, route[routeIndex].z - now.z) < 0.8) routeIndex += 1;
+            const waypoint = route[routeIndex] || target.path.approach;
+            await page.lookTo(Math.atan2(-(waypoint.x - now.x), -(waypoint.z - now.z)), 0);
+            await sleep(80);
+          }
+        } finally {
+          await page.key('KeyW', 'keyUp');
+          await page.key('ShiftLeft', 'keyUp');
+        }
+
+        const previousSnapshot = bot.snap;
+        let observedSnapshot = previousSnapshot;
+        let stableX = null;
+        let stableZ = null;
+        let stableTicks = 0;
+        const settled = await waitFor(
+          () => {
+            if (bot.snap === observedSnapshot) return false;
+            observedSnapshot = bot.snap;
+            const current = bot.find('치즈');
+            if (!current) return false;
+            if (stableX !== null && Math.hypot(current.x - stableX, current.z - stableZ) < 0.03) stableTicks += 1;
+            else stableTicks = 0;
+            stableX = current.x;
+            stableZ = current.z;
+            return stableTicks >= 2 ? current : false;
+          },
+          { timeout: 4000, interval: 50, message: 'W 해제 후 위치가 안정된 서버 스냅샷을 확인하지 못했다' },
+        ).catch(() => null);
+        me = bot.find('치즈');
+        finalDistance = me && target ? Math.hypot(target.x - me.x, target.z - me.z) : Infinity;
+        if (!settled || !me?.alive || finalDistance >= 2.2 || !availableIds().has(target.id)) {
+          attempts += 1;
+          continue;
+        }
+
+        const toastBefore = await page.text('#toast');
+        const toastVisibleBefore = await page.visible('#toast');
+        await page.press('KeyF', 80);
+        picked = await waitFor(
+          async () => {
+            const toast = await page.text('#toast');
+            const visible = await page.visible('#toast');
+            return visible && /보급 획득/.test(toast) && (!toastVisibleBefore || toast !== toastBefore);
+          },
+          { timeout: 1800, interval: 50, message: `F 입력 뒤 새 보급 획득 토스트가 없다(${target.kind}#${target.id})` },
+        ).then(() => true).catch(() => false);
+        if (!picked) attempts += 1;
+      }
+
       const toastText = await page.text('#toast');
-      assert(picked, '줍기 결과가 없다');
+      if (!picked && /보급 획득/.test(toastText)) picked = true;
+      const latest = bot.find('치즈');
+      const debugAfterLoot = await page.debug();
+      const pauseVisible = await page.visible('#pause');
+      const readyNow = target ? (bot.snap?.items?.find(([id]) => id === target.id)?.[1] ?? 'unknown') : 'no-target';
+      const nearbyReady = target && latest
+        ? (debugAfterLoot.loot || [])
+            .map((item) => ({ id: item.id, kind: item.kind, distance: Math.hypot(latest.x - item.x, latest.z - item.z), ready: bot.snap?.items?.find(([id]) => id === item.id)?.[1] }))
+            .filter((item) => item.distance <= 2.8)
+            .map((item) => `${item.kind}#${item.id}@${item.distance.toFixed(2)}m/ready${item.ready}`)
+            .join(',')
+        : '';
+      const newLootEvents = bot.events.slice(lootRouteMark).filter((event) => event.k === 'loot').map((event) => `${event.kind}#${event.id}:by${event.by}`).join(',');
+      assert(
+        picked,
+        `줍기 결과가 없다(target=${target ? `${target.kind}#${target.id}` : 'none'}, distance=${finalDistance.toFixed(2)}m, ready=${readyNow}, nearby=[${nearbyReady}], toast=${toastText}, phase=${debugAfterLoot.phase}, paused=${pauseVisible}, locked=${debugAfterLoot.locked}, owned=${JSON.stringify(debugAfterLoot.owned)}, kits=${debugAfterLoot.kits}, hp=${debugAfterLoot.hp}, lootDuringRoute=[${newLootEvents}], attempts=${attempts})`,
+      );
       assert(/획득|보급|탄약|힐|구급/.test(toastText), `획득 토스트가 없다: ${toastText}`);
       await page.shot('05c-loot');
-      void reserveBefore;
-    });
-
-    await step('드래그 조준 모드: 마우스 고정이 안 되는 브라우저에서도 시점이 돈다', async () => {
-      await page.eval(`document.dispatchEvent(new Event('pointerlockerror'))`);
-      await sleep(200);
-      const d = await page.debug();
-      assert(d.lockUnavailable === true, '잠금 실패 시 드래그 모드로 전환되지 않았다');
-      const yawBefore = (await page.debug()).yaw;
-      await page.mouseDown();
-      await sleep(60);
-      await page.mouseMove(120, 0);
-      await sleep(160);
-      await page.mouseUp();
-      const yawAfter = (await page.debug()).yaw;
-      const diff = Math.abs(((yawAfter - yawBefore + Math.PI * 3) % (Math.PI * 2)) - Math.PI);
-      assert(diff > 0.05, `드래그로 시점이 돌아가지 않았다(diff ${diff.toFixed(3)})`);
     });
 
     await step('ESC(잠금 해제) → 일시정지 → 재고정 버튼으로 복귀, 카메라 각도 유지', async () => {
@@ -1224,6 +1484,29 @@ async function main() {
       if (after === 'locked') assert(!(await page.visible('#pause')), '잠금 후에도 일시정지가 남아 있다');
       const yawNow = bot.find('치즈').yaw;
       assert(Math.abs(yawNow - before) < 0.05, `재고정 과정에서 카메라가 튀었다: ${before} → ${yawNow}`);
+    });
+
+    await step('드래그 조준 모드: 마우스 고정이 안 되는 브라우저에서도 시점이 돈다', async () => {
+      await page.eval('document.exitPointerLock()');
+      await waitFor(
+        async () => !(await page.eval('Boolean(document.pointerLockElement)')) && (await page.visible('#pause')),
+        { message: '드래그 테스트 전에 마우스 잠금이 풀리지 않았다' },
+      );
+      await page.eval(`document.dispatchEvent(new Event('pointerlockerror'))`);
+      await sleep(200);
+      const d = await page.debug();
+      assert(d.lockUnavailable === true, '잠금 실패 시 드래그 모드로 전환되지 않았다');
+      const yawBefore = d.yaw;
+      const x = Math.round(page.width / 2);
+      const y = Math.round(page.height / 2);
+      await page.send('Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', clickCount: 1 });
+      await sleep(60);
+      await page.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: x + 120, y, button: 'left', buttons: 1 });
+      await sleep(160);
+      await page.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: x + 120, y, button: 'left', buttons: 0, clickCount: 1 });
+      const yawAfter = (await page.debug()).yaw;
+      const diff = Math.abs(((yawAfter - yawBefore + Math.PI * 3) % (Math.PI * 2)) - Math.PI);
+      assert(diff > 0.05, `드래그로 시점이 돌아가지 않았다(diff ${diff.toFixed(3)})`);
     });
 
     await step('콘솔 오류 0건(JS 예외·리소스 실패 없음)', async () => {

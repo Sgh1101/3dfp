@@ -448,10 +448,14 @@ test('README: 조작법 표에 PC/모바일이 모두 있다', () => {
   }
 });
 
-test('README: 배틀로얄 규칙과 미확인(검증) 항목이 구분돼 있다', () => {
+test('README: 배틀로얄 규칙·신규 기능·호스팅 한계를 설명한다', () => {
   assert(/노리스폰/.test(readme), '노리스폰 규칙이 없다');
   assert(/마지막 생존자/.test(readme), '마지막 생존자 승리 규칙이 없다');
-  assert(/공개 배포/.test(readme), '공개 배포 보류 안내가 없다');
+  for (const feature of ['점프', '정조준', '보급품', 'AI 대전']) {
+    assert(readme.includes(feature), `README 에 ${feature} 안내가 없다`);
+  }
+  assert(/서버리스 호스팅/.test(readme) && /WebSocket/.test(readme), '호스팅 제약 안내가 없다');
+  assert(!/공개 배포 금지|공개 배포용이 아닙니다/.test(readme), '이미 끝난 배포 보류 문구가 남아 있다');
 });
 
 test('CREDITS: Three.js/ws 라이선스와 에셋 출처가 적혀 있다', () => {

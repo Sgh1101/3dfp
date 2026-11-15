@@ -1850,8 +1850,8 @@ function onEvents(msg) {
         break;
       }
       case 'jump':
-        if (ev.id !== state.myId && distanceToMe({ 0: 0, 2: 0 }) >= 0) {
-          // 다른 사람 점프: 가까우면 발소리 느낌만
+        if (ev.id !== state.myId && distanceToMe([ev.x, 0, ev.z]) < 40) {
+          // 다른 사람 점프: 가까운 거리에서만 발소리 느낌을 낸다.
           audio.footstep(1);
         }
         break;
@@ -2084,20 +2084,8 @@ function updateHud() {
     dom.resultCountdown.textContent = `${state.round.nextIn}초 후 자동으로 다음 라운드가 시작됩니다. 전원 부활·탄약·구역이 초기화됩니다. (${state.round.ready}/${state.round.total} 준비)`;
   }
 
-  // 라운드가 진행 중인데 마우스 고정이 풀려 있으면(결과 창·ESC) 재고정 버튼을 띄운다.
-  if (
-    state.phase === 'playing' &&
-    !isTouch &&
-    !state.lockUnavailable &&
-    me.alive &&
-    roundState === 'live' &&
-    !resultOpen &&
-    document.pointerLockElement !== dom.canvas &&
-    dom.pause.classList.contains('hidden') &&
-    performance.now() > state.suppressPauseUntil
-  ) {
-    showPause('조준 다시 고정', '라운드가 진행 중입니다. 계속하려면 마우스를 다시 고정하세요.');
-  }
+  // 결과 화면에서 포인터 잠금을 푼 상태를 HUD 갱신이 stale pause로 다시 띄우지 않는다.
+  // 실제 잠금 해제는 pointerlockchange, 재고정 실패는 resumeFromPause에서 안내한다.
 
   dom.ping.textContent = net.rtt ? `${net.rtt}ms` : '--ms';
 }
@@ -2508,6 +2496,8 @@ async function boot() {
       initMuzzleEffects();
       setViewmodel(1);
       animate();
+      // 지연 초기화 경고는 성공적으로 월드가 구성된 뒤에만 숨긴다.
+      document.getElementById('boot-error')?.classList.add('hidden');
     } catch (err) {
       console.error('[3dfp] 월드 구성 실패', err);
       showMenuError('맵을 불러오지 못했습니다. 새로 고침해 주세요.');

@@ -212,6 +212,17 @@ test('정면 사격이 명중하고 피해를 준다', () => {
   assert.strictEqual(a.mag[1], 29);
 });
 
+test('머리 볼륨에 명중하면 헤드샷 배율을 적용한다', () => {
+  const game = newGame();
+  const [a, b] = addPlayers(game, [['a', '알파'], ['b', '베타']]);
+  place(a, 60, 0, Math.PI, 0);
+  place(b, 60, 10, 0, 0);
+  game.handleShoot('a', { yaw: Math.PI, pitch: 0 }); // 눈높이(1.62m), 머리 볼륨
+  assert.strictEqual(b.hp, 100 - 24 * HEADSHOT_MULT);
+  const hit = game.drainEvents().find((event) => event.k === 'hit' && event.id === 'b');
+  assert.ok(hit && hit.head === 1, '헤드샷 이벤트가 표시되지 않았다');
+});
+
 test('커버 뒤 플레이어는 맞지 않는다', () => {
   const game = newGame();
   const [a, b] = addPlayers(game, [['a', '알파'], ['b', '베타']]);
@@ -390,6 +401,16 @@ test('범위 밖·재사용 대기 중 아이템은 지급되지 않는다', () 
   assert.strictEqual(a.reserve[1], after, '재사용 대기 중인 아이템이 또 지급됐다');
 });
 
+test('새 라운드 시작 시 보급품 재사용 대기시간이 초기화된다', () => {
+  const game = newGame();
+  addPlayers(game, [['a', '알파'], ['b', '베타']]);
+  const now = Date.now();
+  for (const item of game.items) item.readyAt = now + 60000;
+  game.round.state = 'ended';
+  game.startRound(now);
+  assert.ok(game.items.every((item) => item.readyAt === 0), '이전 라운드의 보급품 대기가 남아 있다');
+});
+
 test('이미 가득 찬 상태에서는 아이템을 소모하지 않는다', () => {
   const game = newGame();
   const [a] = addPlayers(game, [['a', '알파']]);
@@ -421,7 +442,10 @@ test('점프하면 y가 올라가고 중력으로 다시 0에 착지한다', () 
   assert.strictEqual(a.y, 0, `착지하지 않았다: y=${a.y}`);
   assert.strictEqual(a.grounded, true);
   const events = game.drainEvents();
-  assert.ok(events.some((e) => e.k === 'jump' && e.id === 'a'), 'jump 이벤트가 없다');
+  const jump = events.find((e) => e.k === 'jump' && e.id === 'a');
+  assert.ok(jump, 'jump 이벤트가 없다');
+  assert.strictEqual(jump.x, 60, 'jump 이벤트 x 좌표가 없다');
+  assert.strictEqual(jump.z, 0, 'jump 이벤트 z 좌표가 없다');
   assert.ok(events.some((e) => e.k === 'land' && e.id === 'a'), 'land 이벤트가 없다');
 });
 
