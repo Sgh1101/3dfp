@@ -1,0 +1,20 @@
+# 의존성
+node_modules/
+npm-debug.log*
+yarn-error.log*
+
+# 로컬 환경
+.env
+.env.*
+*.local
+
+# OS / 에디터
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+# 임시 파일
+*.log
+tmp/

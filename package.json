@@ -1,0 +1,26 @@
+{
+  "name": "3dfp",
+  "version": "0.1.0",
+  "private": true,
+  "description": "3D 1인칭 멀티플레이어 브라우저 FPS — 초기 클라이언트/서버 골격",
+  "main": "server/index.js",
+  "scripts": {
+    "start": "node server/index.js",
+    "dev": "node server/index.js",
+    "check": "node scripts/check.js",
+    "test": "node test/unit.js && node test/smoke.js"
+  },
+  "keywords": [
+    "fps",
+    "three.js",
+    "websocket",
+    "multiplayer"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
