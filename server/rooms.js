@@ -9,6 +9,7 @@
  */
 
 const { Game } = require('./game');
+const { BotDirector } = require('./bots');
 const { MAX_ROOMS } = require('./limits');
 
 const MAX_PLAYERS_PER_ROOM = 8;
@@ -26,16 +27,23 @@ const ERROR = Object.freeze({
 });
 
 class Room {
-  constructor(code, isDefault = false) {
+  constructor(code, isDefault = false, botOptions = null) {
     this.code = code;
     this.isDefault = Boolean(isDefault);
     this.createdAt = Date.now();
-    this.game = new Game(code, isDefault);
+    this.game = new Game(code, isDefault, botOptions, MAX_PLAYERS_PER_ROOM);
+    // AI 두뇌는 게임 인스턴스에 붙인다(순환 require 를 피하려고 여기서 주입한다).
+    this.game.botBrain = new BotDirector(this.game);
     this.emptySince = null;
+    if (this.game.botPolicy.count > 0 || this.game.botPolicy.fill) this.game.syncBots();
   }
 
   get playerCount() {
     return this.game.playerCount;
+  }
+
+  get humanCount() {
+    return this.game.humanCount;
   }
 
   get isFull() {
@@ -78,10 +86,10 @@ class RoomManager {
   }
 
   /** 방 생성. 한도에 도달했으면 null. */
-  createRoom() {
+  createRoom(botOptions = null) {
     if (this.isFull) return null;
     const code = this.generateCode();
-    const room = new Room(code, false);
+    const room = new Room(code, false, botOptions);
     this.rooms.set(code, room);
     return room;
   }
@@ -108,7 +116,13 @@ class RoomManager {
     let room;
 
     if (wantsCreate) {
-      room = this.createRoom();
+      // 봇 설정은 방을 만드는 사람만 정할 수 있다(남의 방에 봇을 끼워넣기 방지).
+      const botOptions = {
+        count: Number(request.bots) || 0,
+        fill: Boolean(request.fillBots),
+        difficulty: typeof request.difficulty === 'string' ? request.difficulty : 'normal',
+      };
+      room = this.createRoom(botOptions);
       if (!room) return { error: ERROR.TOO_MANY_ROOMS };
     } else {
       const rawCode = request && (request.code ?? request.roomCode);
@@ -121,7 +135,9 @@ class RoomManager {
       }
     }
 
-    if (room.isFull) return { error: ERROR.ROOM_FULL };
+    // 정원은 사람+AI 합산 8명. 봇이 자리를 차지하고 있으면 사람이 들어올 자리를 비켜 준다.
+    if (room.humanCount >= MAX_PLAYERS_PER_ROOM) return { error: ERROR.ROOM_FULL };
+    if (room.isFull && room.game.botCount === 0) return { error: ERROR.ROOM_FULL };
 
     room.game.addPlayer(playerId, name);
     room.emptySince = null;
@@ -132,8 +148,9 @@ class RoomManager {
   tick(now = Date.now()) {
     const active = [];
     for (const room of this.rooms.values()) {
-      if (room.playerCount === 0) {
-        // 빈 방에 쌓인 이벤트는 버린다(다음 참가자에게 과거 이벤트가 가지 않도록).
+      // 사람이 없는 방(봇만 남은 방 포함)은 게임을 돌리지 않고 정리한다.
+      if (room.humanCount === 0) {
+        room.game.removeBots();
         room.game.drainEvents();
         room.game.drainDirect();
         if (room.isDefault) continue;

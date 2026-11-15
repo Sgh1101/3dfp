@@ -25,6 +25,11 @@ const dom = {
   btnJoin: document.getElementById('btn-join'),
   btnQuick: document.getElementById('btn-quick'),
   btnCreate: document.getElementById('btn-create'),
+  btnAi: document.getElementById('btn-ai'),
+  botCount: document.getElementById('bot-count'),
+  botDifficulty: document.getElementById('bot-difficulty'),
+  botFill: document.getElementById('bot-fill'),
+  autoPickup: document.getElementById('auto-pickup'),
   pause: document.getElementById('pause'),
   pauseTitle: document.getElementById('pause-title'),
   pauseText: document.getElementById('pause-text'),
@@ -72,10 +77,29 @@ const dom = {
   btnReload: document.getElementById('btn-reload'),
   btnSwap: document.getElementById('btn-swap'),
   btnHeal: document.getElementById('btn-heal'),
+  btnJump: document.getElementById('btn-jump'),
+  btnAim: document.getElementById('btn-aim'),
+  btnCrouch: document.getElementById('btn-crouch'),
+  btnLoot: document.getElementById('btn-loot'),
+  compass: document.getElementById('compass'),
+  minimap: document.getElementById('minimap'),
+  adsOverlay: document.getElementById('ads-overlay'),
+  toast: document.getElementById('toast'),
+  killBanner: document.getElementById('kill-banner'),
+  killBannerText: document.getElementById('kill-banner-text'),
+  damageNumbers: document.getElementById('damage-numbers'),
+  soundToggle: document.getElementById('sound-toggle'),
+  lootHint: document.getElementById('loot-hint'),
+  stanceBadge: document.getElementById('stance-badge'),
 };
 
 const VIEW_DELAY_MS = 90; // 원격 플레이어 보간 지연
 const MOUSE_SENSITIVITY = 0.0022;
+const TOUCH_SENSITIVITY = 1.7;
+/** PointerLock 요청 후 이 시간 안에 잠기지 않으면 드래그 시점 모드로 전환한다. */
+const LOCK_TIMEOUT_MS = 900;
+const PITCH_LIMIT = 1.45;
+const MAX_FALL_SPEED = 42;
 
 const state = {
   phase: 'menu', // menu | connecting | playing
@@ -88,6 +112,8 @@ const state = {
     x: 0,
     y: 0,
     z: 0,
+    vy: 0,
+    grounded: true,
     yaw: 0,
     pitch: 0,
     hp: 100,
@@ -100,6 +126,13 @@ const state = {
     kits: 2,
     spawnProtect: false,
     reloadMs: 0,
+    /** 앉기/달리기/정조준 상태(서버에 같이 보내 탄퍼짐·속도·피격 박스에 반영) */
+    crouch: false,
+    sprint: false,
+    ads: false,
+    /** 현재 보간된 눈높이·화각 */
+    eye: 1.62,
+    fov: 78,
   },
   zone: null,
   round: null,
@@ -124,6 +157,39 @@ const state = {
   lastStepAt: 0,
   ignoreMoves: 0,
   hudWarnAt: 0,
+  /** 마우스를 누른 채 끄는 시점 회전(PointerLock 없이도 동작) */
+  dragLook: false,
+  dragLastX: 0,
+  dragLastY: 0,
+  lockTimer: 0,
+  /** 보급 상자 상태/힌트 */
+  loot: [],
+  lootOpen: false,
+  /** 시점/카메라 연출 */
+  bobT: 0,
+  viewKick: 0,
+  landDip: 0,
+  /** 마지막으로 계산한 이동 속도 비율 */
+  speedRatio: 0,
+  muted: false,
+  lastLootAt: 0,
+  lastHitAt: 0,
+  /** 이번 판 최근 킬 배너 타이머 */
+  killBannerTimer: 0,
+  /** 정조준 토글/홀드, 모바일 앉기 */
+  adsToggle: false,
+  adsHold: false,
+  touchCrouch: false,
+  /** 자동 줍기 옵션 */
+  autoPickup: true,
+  /** 보급 아이템 준비 상태(id → true/false) */
+  items: new Map(),
+  lootMeshes: null,
+  /** 조준선 별어짐(px) */
+  bloom: 4,
+  /** 이번 프레임 이동 여부(걸음/봅) */
+  movingNow: false,
+  lastMinimapAt: 0,
 };
 
 /* ── Three.js 기본 ─────────────────────────────────────────── */
@@ -507,7 +573,7 @@ function updateEffects(now) {
 }
 
 /* ── 원격 플레이어 아바타 ──────────────────────────────────── */
-function nameSprite(name) {
+function nameSprite(name, color = '#a7f3d0') {
   const canvas = document.createElement('canvas');
   canvas.width = 256;
   canvas.height = 64;
@@ -526,7 +592,7 @@ function nameSprite(name) {
   ctx.lineWidth = 6;
   ctx.strokeStyle = 'rgba(0,0,0,0.75)';
   ctx.strokeText(name, 128, 34);
-  ctx.fillStyle = '#a7f3d0';
+  ctx.fillStyle = color;
   ctx.fillText(name, 128, 34);
   const tex = new THREE.CanvasTexture(canvas);
   tex.colorSpace = THREE.SRGBColorSpace;
@@ -543,11 +609,11 @@ function hashColor(id) {
   return new THREE.Color().setHSL(h / 360, 0.55, 0.55);
 }
 
-function createAvatar(id, name) {
+function createAvatar(id, name, isBot = false) {
   const group = new THREE.Group();
   const color = hashColor(id);
 
-  const bodyMat = new THREE.MeshStandardMaterial({ color, roughness: 0.6, metalness: 0.2 });
+  const bodyMat = new THREE.MeshStandardMaterial({ color, roughness: 0.6, metalness: 0.2, emissive: 0x330000, emissiveIntensity: 0.35 });
   const body = new THREE.Mesh(new THREE.CapsuleGeometry(0.33, 0.85, 4, 12), bodyMat);
   body.position.y = 0.95;
   body.castShadow = !isTouch;
@@ -563,7 +629,7 @@ function createAvatar(id, name) {
 
   const visor = new THREE.Mesh(
     new THREE.BoxGeometry(0.34, 0.09, 0.06),
-    new THREE.MeshStandardMaterial({ color: 0x0f172a, emissive: 0x34d399, emissiveIntensity: 0.6 }),
+    new THREE.MeshStandardMaterial({ color: 0x0f172a, emissive: 0xf87171, emissiveIntensity: 0.7 }),
   );
   visor.position.set(0, 1.66, -0.22);
   group.add(visor);
@@ -575,13 +641,39 @@ function createAvatar(id, name) {
   gun.position.set(0.26, 1.2, -0.28);
   group.add(gun);
 
-  const label = nameSprite(name);
+  // 적 이름표(적=붉은 톤) + 체력바(스프라이트라 항상 카메라를 향한다)
+  const label = nameSprite(name, isBot ? '#fcd34d' : '#fda4af');
   group.add(label);
 
+  const hpBg = new THREE.Sprite(
+    new THREE.SpriteMaterial({ color: 0x0b0f14, transparent: true, opacity: 0.8, depthTest: true }),
+  );
+  hpBg.scale.set(0.94, 0.12, 1);
+  hpBg.position.y = 2.06;
+  group.add(hpBg);
+
+  const hpFill = new THREE.Sprite(new THREE.SpriteMaterial({ color: 0x34d399, depthTest: true }));
+  hpFill.scale.set(0.9, 0.08, 1);
+  hpFill.position.set(0, 2.06, 0.01);
+  group.add(hpFill);
+
   scene.add(group);
-  const avatar = { id, name, group, head, gun, label, weapon: 1, buffer: [], lastSeen: performance.now() };
+  const avatar = { id, name, group, head, gun, label, hpBg, hpFill, weapon: 1, hp: 100, isBot, buffer: [], lastSeen: performance.now() };
   state.avatars.set(id, avatar);
+  updateAvatarHealth(avatar, 100);
   return avatar;
+}
+
+/** 원격 플레이어 체력바 갱신(HP 비율만큼 줄이고 왼쪽 정렬) */
+function updateAvatarHealth(avatar, hp) {
+  if (!avatar.hpFill) return;
+  const ratio = Math.max(0, Math.min(1, hp / 100));
+  avatar.hpFill.scale.set(Math.max(0.001, 0.9 * ratio), 0.08, 1);
+  avatar.hpFill.position.x = -0.45 * (1 - ratio);
+  const color = ratio > 0.5 ? 0x34d399 : ratio > 0.25 ? 0xfbbf24 : 0xf87171;
+  avatar.hpFill.material.color.setHex(color);
+  avatar.hpBg.visible = ratio > 0;
+  avatar.hpFill.visible = ratio > 0;
 }
 
 /** 원격 플레이어가 든 무기를 실루엣으로 구분할 수 있게 총 모델을 바꾼다. */
@@ -606,13 +698,19 @@ function removeAvatar(id) {
   state.avatars.delete(id);
 }
 
-function pushSample(avatar, x, z, yaw, pitch, now) {
+function pushSample(avatar, x, y, z, yaw, pitch, now) {
   const buf = avatar.buffer;
   const last = buf[buf.length - 1];
-  if (last && Math.abs(last.x - x) < 0.01 && Math.abs(last.z - z) < 0.01 && Math.abs(last.yaw - yaw) < 0.01) {
+  if (
+    last &&
+    Math.abs(last.x - x) < 0.01 &&
+    Math.abs(last.y - y) < 0.01 &&
+    Math.abs(last.z - z) < 0.01 &&
+    Math.abs(last.yaw - yaw) < 0.01
+  ) {
     return;
   }
-  buf.push({ t: now, x, z, yaw, pitch });
+  buf.push({ t: now, x, y, z, yaw, pitch });
   while (buf.length > 24) buf.shift();
 }
 
@@ -634,6 +732,7 @@ function sampleAvatar(avatar, renderTime) {
       const k = (renderTime - a.t) / Math.max(1, b.t - a.t);
       return {
         x: a.x + (b.x - a.x) * k,
+        y: (a.y || 0) + ((b.y || 0) - (a.y || 0)) * k,
         z: a.z + (b.z - a.z) * k,
         yaw: lerpAngle(a.yaw, b.yaw, k),
         pitch: a.pitch + (b.pitch - a.pitch) * k,
@@ -643,25 +742,288 @@ function sampleAvatar(avatar, renderTime) {
   return buf[buf.length - 1];
 }
 
+/* ── 보급 아이템 3D 마커 ──────────────────────────────────── */
+const LOOT_COLORS = { weapon: 0xfb923c, ammo: 0x38bdf8, kit: 0x34d399, medkit: 0xf87171 };
+
+function buildLootMarkers() {
+  if (!scene || !state.config?.loot) return;
+  if (state.lootMeshes) {
+    for (const group of state.lootMeshes.values()) scene.remove(group);
+    state.lootMeshes.clear();
+  } else {
+    state.lootMeshes = new Map();
+  }
+  const geo = new THREE.BoxGeometry(0.52, 0.34, 0.52);
+  for (const item of state.config.loot) {
+    const color = LOOT_COLORS[item.kind] ?? 0x94a3b8;
+    const group = new THREE.Group();
+    const box = new THREE.Mesh(
+      geo,
+      new THREE.MeshStandardMaterial({ color, emissive: color, emissiveIntensity: 0.4, roughness: 0.45, metalness: 0.35 }),
+    );
+    box.position.y = 0.2;
+    group.add(box);
+    const beam = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.07, 0.07, 1.8, 6, 1, true),
+      new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.16, depthWrite: false }),
+    );
+    beam.position.y = 0.95;
+    group.add(beam);
+    group.position.set(item.x, 0, item.z);
+    scene.add(group);
+    state.lootMeshes.set(item.id, group);
+  }
+}
+
+function updateLootSpinner(dt) {
+  if (!state.lootMeshes) return;
+  for (const group of state.lootMeshes.values()) {
+    if (!group.visible) continue;
+    group.rotation.y += dt * 1.4;
+  }
+}
+
+/* ── 알림 · 배너 · 피해 숫자 ─────────────────────────────── */
+function showToast(text) {
+  if (!text || !dom.toast) return;
+  dom.toast.textContent = text;
+  dom.toast.classList.add('show');
+  window.clearTimeout(showToast.timer);
+  showToast.timer = window.setTimeout(() => dom.toast.classList.remove('show'), 2200);
+}
+
+function showKillBanner(win, headshot = false) {
+  if (!dom.killBanner) return;
+  dom.killBannerText.textContent = headshot ? '헤드샷 처치!' : '적 처치!';
+  dom.killBanner.classList.remove('show');
+  void dom.killBanner.offsetWidth;
+  dom.killBanner.classList.add('show');
+  audio.killConfirm(Boolean(headshot));
+  window.clearTimeout(state.killBannerTimer);
+  state.killBannerTimer = window.setTimeout(() => dom.killBanner.classList.remove('show'), 1400);
+}
+
+function spawnDamageNumber(dmg, head = false) {
+  if (!dom.damageNumbers || !Number.isFinite(dmg)) return;
+  const el = document.createElement('div');
+  el.className = `dmg-num${head ? ' head' : ''}`;
+  el.textContent = head ? `${dmg} 헤드` : String(dmg);
+  el.style.left = `${50 + (Math.random() * 8 - 4)}%`;
+  el.style.top = `${50 + (Math.random() * 8 - 3)}%`;
+  dom.damageNumbers.appendChild(el);
+  window.setTimeout(() => el.remove(), 780);
+}
+
+/* ── 캔버스 HUD(나침반 · 미니맵 · 조준선) ──────────────────── */
+function ensureCanvasSize(canvas) {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const w = canvas.clientWidth;
+  const h = canvas.clientHeight;
+  if (!w || !h) return null;
+  if (canvas.width !== Math.round(w * dpr) || canvas.height !== Math.round(h * dpr)) {
+    canvas.width = Math.round(w * dpr);
+    canvas.height = Math.round(h * dpr);
+  }
+  const ctx = canvas.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  return { ctx, w, h };
+}
+
+/** yaw(라디안) → 나침반 방위각(도, 북=0, 동=90) */
+function headingDegrees(yaw) {
+  return ((-yaw * 180) / Math.PI + 360) % 360;
+}
+
+function drawCompass() {
+  const canvas = dom.compass;
+  if (!canvas) return;
+  const sized = ensureCanvasSize(canvas);
+  if (!sized) return;
+  const { ctx, w, h } = sized;
+  ctx.clearRect(0, 0, w, h);
+  const heading = headingDegrees(state.me.yaw);
+  const span = 140; // ±70도
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.font = 'bold 11px system-ui, -apple-system, sans-serif';
+  const labels = { 0: 'N', 90: 'E', 180: 'S', 270: 'W' };
+  for (let deg = 0; deg < 360; deg += 15) {
+    const rel = ((deg - heading + 540) % 360) - 180;
+    if (Math.abs(rel) > span / 2) continue;
+    const x = w / 2 + (rel / (span / 2)) * (w / 2 - 8);
+    const major = deg % 90 === 0;
+    ctx.strokeStyle = major ? 'rgba(226,255,247,0.9)' : 'rgba(226,255,247,0.28)';
+    ctx.lineWidth = major ? 2 : 1;
+    ctx.beginPath();
+    ctx.moveTo(x, h - 2);
+    ctx.lineTo(x, h - (major ? 11 : 6));
+    ctx.stroke();
+    if (major) {
+      ctx.fillStyle = deg === 0 ? '#f87171' : 'rgba(226,255,247,0.88)';
+      ctx.fillText(labels[deg], x, h - 19);
+    }
+  }
+  // 안전 구역 중심 방향
+  if (state.zone) {
+    const dx = state.zone.centerX - state.me.x;
+    const dz = state.zone.centerZ - state.me.z;
+    const targetHeading = ((Math.atan2(dx, -dz) * 180) / Math.PI + 360) % 360;
+    const rel = ((targetHeading - heading + 540) % 360) - 180;
+    const clamped = Math.max(-span / 2, Math.min(span / 2, rel));
+    const x = w / 2 + (clamped / (span / 2)) * (w / 2 - 8);
+    ctx.fillStyle = 'rgba(56,189,248,0.9)';
+    ctx.beginPath();
+    ctx.moveTo(x, h - 13);
+    ctx.lineTo(x - 4, h - 21);
+    ctx.lineTo(x + 4, h - 21);
+    ctx.closePath();
+    ctx.fill();
+  }
+  // 현재 방위 표시
+  ctx.fillStyle = '#34d399';
+  ctx.beginPath();
+  ctx.moveTo(w / 2, 2);
+  ctx.lineTo(w / 2 - 5, 9);
+  ctx.lineTo(w / 2 + 5, 9);
+  ctx.closePath();
+  ctx.fill();
+}
+
+function drawMinimap(now) {
+  const canvas = dom.minimap;
+  if (!canvas || !state.map) return;
+  // 20fps 면 충분하다.
+  if (now - state.lastMinimapAt < 50) return;
+  const sized = ensureCanvasSize(canvas);
+  if (!sized) return;
+  state.lastMinimapAt = now;
+  const { ctx, w, h } = sized;
+  const half = state.map.arena.size / 2;
+  const scale = Math.min(w, h) / state.map.arena.size;
+  const toX = (x) => w / 2 + x * scale;
+  const toY = (z) => h / 2 + z * scale;
+
+  ctx.clearRect(0, 0, w, h);
+  ctx.fillStyle = 'rgba(8,14,20,0.74)';
+  ctx.fillRect(0, 0, w, h);
+
+  ctx.fillStyle = 'rgba(148,163,184,0.5)';
+  for (const cover of state.map.covers) {
+    ctx.fillRect(toX(cover.x - cover.w / 2), toY(cover.z - cover.d / 2), Math.max(1, cover.w * scale), Math.max(1, cover.d * scale));
+  }
+
+  if (state.zone) {
+    ctx.strokeStyle = state.zone.shrinking ? 'rgba(251,191,36,0.9)' : 'rgba(56,189,248,0.85)';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.arc(toX(state.zone.centerX), toY(state.zone.centerZ), Math.max(2, state.zone.radius * scale), 0, Math.PI * 2);
+    ctx.stroke();
+  }
+
+  for (const item of state.config?.loot || []) {
+    if (state.items.get(item.id) === false) continue;
+    if (Math.hypot(item.x - state.me.x, item.z - state.me.z) > 42) continue;
+    ctx.fillStyle = `#${(LOOT_COLORS[item.kind] ?? 0x94a3b8).toString(16).padStart(6, '0')}`;
+    ctx.fillRect(toX(item.x) - 1.5, toY(item.z) - 1.5, 3, 3);
+  }
+
+  for (const avatar of state.avatars.values()) {
+    if (!avatar.group.visible) continue;
+    const p = avatar.group.position;
+    if (Math.hypot(p.x - state.me.x, p.z - state.me.z) > 45) continue;
+    ctx.fillStyle = avatar.isBot ? '#fcd34d' : '#f87171';
+    ctx.beginPath();
+    ctx.arc(toX(p.x), toY(p.z), 2.6, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  // 나(방향 삼각형)
+  const sx = toX(state.me.x);
+  const sy = toY(state.me.z);
+  const angle = headingDegrees(state.me.yaw) * (Math.PI / 180);
+  ctx.save();
+  ctx.translate(sx, sy);
+  ctx.rotate(angle);
+  ctx.fillStyle = '#34d399';
+  ctx.beginPath();
+  ctx.moveTo(0, -5.5);
+  ctx.lineTo(4, 4);
+  ctx.lineTo(0, 2);
+  ctx.lineTo(-4, 4);
+  ctx.closePath();
+  ctx.fill();
+  ctx.restore();
+
+  ctx.strokeStyle = 'rgba(120,220,180,0.28)';
+  ctx.lineWidth = 1;
+  ctx.strokeRect(0.5, 0.5, w - 1, h - 1);
+  // 아레나 경계(160m) 밖 표시는 맵이 곧 경계라 생략.
+  void half;
+}
+
+/** 이동/사격/정조준에 따라 조준선이 벌어지고 좁아진다. */
+function updateCrosshair(dt) {
+  const me = state.me;
+  let target = 3;
+  if (me.ads) target = -2.5;
+  else {
+    target = 3 + (state.movingNow ? 3.2 : 0) + (me.grounded ? 0 : 5) - (me.crouch ? 1.5 : 0);
+  }
+  state.bloom += (target - state.bloom) * Math.min(1, dt * 9);
+  const gap = Math.max(0, state.bloom).toFixed(1);
+  dom.crosshair.style.setProperty('--gap', `${gap}px`);
+  dom.crosshair.style.setProperty('--ch-alpha', me.ads ? '0.55' : '0.85');
+}
+
+/* ── 사운드 토글 ─────────────────────────────────────────── */
+function setupSoundToggle() {
+  const saved = localStorage.getItem('3dfp.muted');
+  state.muted = saved === '1';
+  audio.setEnabled(!state.muted);
+  if (dom.soundToggle) {
+    dom.soundToggle.textContent = state.muted ? '🔇' : '🔊';
+    dom.soundToggle.title = state.muted ? '소리 켜기' : '소리 끄기';
+    dom.soundToggle.addEventListener('click', () => {
+      state.muted = !state.muted;
+      audio.setEnabled(!state.muted);
+      localStorage.setItem('3dfp.muted', state.muted ? '1' : '0');
+      dom.soundToggle.textContent = state.muted ? '🔇' : '🔊';
+      dom.soundToggle.title = state.muted ? '소리 켜기' : '소리 끄기';
+      if (!state.muted) audio.uiClick();
+    });
+  }
+}
+
 /* ── 입력 ─────────────────────────────────────────────────── */
 function setupInput() {
+  const PREVENT_KEYS = new Set(['Space', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Tab']);
+
   window.addEventListener('keydown', (e) => {
+    if (PREVENT_KEYS.has(e.code)) e.preventDefault();
     if (e.repeat) {
       state.keys.add(e.code);
       return;
     }
     state.keys.add(e.code);
-
-    if (state.phase !== 'playing') return;
+    if (state.phase !== 'playing' || isPaused()) return;
     switch (e.code) {
+      case 'Space':
+        requestJump();
+        break;
       case 'KeyR':
         requestReload();
         break;
       case 'KeyE':
         requestSwap();
         break;
+      case 'KeyF':
+        requestLoot();
+        break;
       case 'KeyQ':
         requestHeal();
+        break;
+      case 'KeyV':
+        toggleAds();
         break;
       case 'Digit1':
         requestSwap(1);
@@ -684,39 +1046,56 @@ function setupInput() {
   window.addEventListener('blur', () => {
     state.keys.clear();
     state.firing = false;
+    state.dragLook = false;
   });
 
-  // 마우스 시점
+  // ── PC 시점 ──────────────────────────────────────────────
+  // 1) PointerLock 이 잠겨 있으면 표준 FPS 방식(movementX/Y).
+  // 2) 잠금이 없거나 실패해도 마우스를 누른 채 끌면 100% 시점이 돈다(드래그 모드).
   document.addEventListener('mousemove', (e) => {
     if (state.phase !== 'playing') return;
+    if (isPaused()) return;
     const locked = document.pointerLockElement === dom.canvas;
-    // PointerLock이 없는 브라우저에서는 마우스를 누른 채 드래그해 시점을 돌린다.
-    if (!locked && !(state.lockUnavailable && state.lookDrag)) return;
-    if (locked && state.ignoreMoves > 0) {
-      state.ignoreMoves -= 1;
-      return;
-    }
-    if (Math.abs(e.movementX) > 260 || Math.abs(e.movementY) > 260) return; // 잠금 직후 튀는 값 무시
-    addLook(e.movementX, e.movementY);
-  });
-
-  // PC: 잠금 상태에서 클릭 = 사격 / 잠금 전 클릭 = 잠금
-  dom.canvas.addEventListener('mousedown', (e) => {
-    if (state.phase !== 'playing' || isTouch) return;
-    if (e.button !== 0) return;
-    if (document.pointerLockElement !== dom.canvas) {
-      // 잠금을 쓸 수 없는 환경이면 클릭 = 사격 + 드래그 시점으로 안내한다.
-      if (state.lockUnavailable) {
-        state.lookDrag = true;
-        audio.resume();
-        state.firing = true;
-        attemptShoot(performance.now());
+    if (locked) {
+      if (state.ignoreMoves > 0) {
+        state.ignoreMoves -= 1;
         return;
       }
-      requestLock();
+      if (Math.abs(e.movementX) > 300 || Math.abs(e.movementY) > 300) return; // 잠금 직후 튀는 값 무시
+      addLook(e.movementX, e.movementY);
       return;
     }
+    if (!state.dragLook || e.buttons === 0) return;
+    // 잠금이 없을 때는 movementX 가 0인 브라우저도 있어 좌표 차분을 함께 쓴다.
+    let dx = e.movementX || 0;
+    let dy = e.movementY || 0;
+    if (dx === 0 && dy === 0 && Number.isFinite(e.clientX)) {
+      dx = e.clientX - state.dragLastX;
+      dy = e.clientY - state.dragLastY;
+    }
+    state.dragLastX = e.clientX;
+    state.dragLastY = e.clientY;
+    if (Math.abs(dx) > 300 || Math.abs(dy) > 300) return;
+    if (dx || dy) addLook(dx, dy);
+  });
+
+  // 우클릭 정조준이 브라우저 메뉴를 열지 않게 한다.
+  dom.canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+
+  dom.canvas.addEventListener('mousedown', (e) => {
+    if (state.phase !== 'playing' || isTouch || isPaused()) return;
+    if (e.button === 2) {
+      e.preventDefault();
+      state.adsHold = true;
+      setAds(true);
+      return;
+    }
+    if (e.button !== 0) return;
     audio.resume();
+    state.dragLook = true;
+    state.dragLastX = e.clientX;
+    state.dragLastY = e.clientY;
+    if (document.pointerLockElement !== dom.canvas) requestLock(true);
     state.firing = true;
     attemptShoot(performance.now());
   });
@@ -724,17 +1103,19 @@ function setupInput() {
   window.addEventListener('mouseup', (e) => {
     if (e.button === 0) {
       state.firing = false;
-      state.lookDrag = false;
+      state.dragLook = false;
     }
-  });
-
-  dom.canvas.addEventListener('click', () => {
-    if (state.phase === 'playing' && !isTouch && document.pointerLockElement !== dom.canvas) requestLock();
+    if (e.button === 2 && state.adsHold) {
+      state.adsHold = false;
+      if (!state.adsToggle) setAds(false);
+    }
   });
 
   document.addEventListener('pointerlockchange', () => {
     const locked = document.pointerLockElement === dom.canvas;
     if (locked) {
+      window.clearTimeout(state.lockTimer);
+      state.lockTimer = 0;
       state.ignoreMoves = 2;
       dom.pause.classList.add('hidden');
       state.firing = false;
@@ -750,39 +1131,66 @@ function setupInput() {
     }
   });
 
+  // 잠금 요청이 거절되면 즉시 드래그 시점 모드로 전환한다(조준이 죽지 않게).
+  document.addEventListener('pointerlockerror', () => {
+    if (state.phase === 'playing') onLockUnavailable();
+  });
+
   dom.pause.addEventListener('click', () => resumeFromPause());
   dom.btnResume.addEventListener('click', () => resumeFromPause());
 
-  // 모바일: 오른쪽 화면 드래그로 시점 회전
+  // ── 모바일: 오른손 시점 드래그 ─────────────────────────
+  // 캔버스가 아닌 조작 버튼은 각자 setPointerCapture 로 입력을 가져가므로,
+  // 시점 드래그 포인터와 사격/점프 포인터가 섞이지 않는다.
+  const lookPointers = new Map();
+
+  const overControl = (x, y) => {
+    for (const el of [dom.joystick, dom.btnFire, dom.btnReload, dom.btnSwap, dom.btnHeal, dom.btnJump, dom.btnAim, dom.btnCrouch, dom.btnLoot]) {
+      if (!el) continue;
+      const r = el.getBoundingClientRect();
+      if (r.width > 0 && x >= r.left - 6 && x <= r.right + 6 && y >= r.top - 6 && y <= r.bottom + 6) return true;
+    }
+    return false;
+  };
+
   dom.canvas.addEventListener('pointerdown', (e) => {
-    if (!isTouch || state.phase !== 'playing') return;
-    if (e.clientX < window.innerWidth * 0.35) return;
-    state.look.pointerId = e.pointerId;
-    state.look.lastX = e.clientX;
-    state.look.lastY = e.clientY;
+    if (!isTouch || state.phase !== 'playing' || isPaused()) return;
+    if (lookPointers.has(e.pointerId)) return;
+    if (overControl(e.clientX, e.clientY)) return; // 조이스틱/버튼 위는 각자 처리
+    if (e.clientX < window.innerWidth * 0.22) return; // 왼쪽 가장자리는 조이스틱 여유
+    lookPointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    // 캡처해서 버튼 위를 지나가도 시점 회전이 끊기지 않게 한다.
+    try {
+      dom.canvas.setPointerCapture(e.pointerId);
+    } catch {
+      /* 캡처 미지원 무시 */
+    }
   });
 
   dom.canvas.addEventListener('pointermove', (e) => {
     if (!isTouch || state.phase !== 'playing') return;
-    if (state.look.pointerId !== e.pointerId) return;
-    const dx = e.clientX - state.look.lastX;
-    const dy = e.clientY - state.look.lastY;
-    state.look.lastX = e.clientX;
-    state.look.lastY = e.clientY;
-    addLook(dx * 1.7, dy * 1.7);
+    const last = lookPointers.get(e.pointerId);
+    if (!last) return;
+    const dx = e.clientX - last.x;
+    const dy = e.clientY - last.y;
+    last.x = e.clientX;
+    last.y = e.clientY;
+    if (!dx && !dy) return;
+    addLook(dx * TOUCH_SENSITIVITY, dy * TOUCH_SENSITIVITY);
   });
 
   const endLook = (e) => {
-    if (state.look.pointerId === e.pointerId) state.look.pointerId = null;
+    lookPointers.delete(e.pointerId);
   };
   dom.canvas.addEventListener('pointerup', endLook);
   dom.canvas.addEventListener('pointercancel', endLook);
+  dom.canvas.addEventListener('lostpointercapture', endLook);
 
-  // 모바일 조이스틱
   if (isTouch) {
     dom.touchControls.classList.remove('hidden');
   }
 
+  // ── 모바일 조이스틱 ─────────────────────────────────────
   let joystickId = null;
   const joystickMax = 42;
 
@@ -813,7 +1221,11 @@ function setupInput() {
 
   dom.joystick.addEventListener('pointerdown', (e) => {
     joystickId = e.pointerId;
-    dom.joystick.setPointerCapture?.(e.pointerId);
+    try {
+      dom.joystick.setPointerCapture(e.pointerId);
+    } catch {
+      /* 무시 */
+    }
     updateJoystick(e.clientX, e.clientY);
     audio.resume();
   });
@@ -824,12 +1236,18 @@ function setupInput() {
   dom.joystick.addEventListener('pointerup', resetJoystick);
   dom.joystick.addEventListener('pointercancel', resetJoystick);
 
-  // 모바일 버튼 (동시 멀티터치 지원: 각 버튼이 독립적으로 pointer 이벤트 처리)
+  // ── 모바일 버튼(멀티터치: 버튼마다 독립 pointer) ─────────
   const bindHoldButton = (el, onDown, onUp) => {
+    if (!el) return;
     el.addEventListener('pointerdown', (e) => {
       e.preventDefault();
+      e.stopPropagation();
       el.classList.add('pressed');
-      el.setPointerCapture?.(e.pointerId);
+      try {
+        el.setPointerCapture(e.pointerId);
+      } catch {
+        /* 무시 */
+      }
       audio.resume();
       onDown?.();
     });
@@ -858,6 +1276,18 @@ function setupInput() {
   bindHoldButton(dom.btnReload, () => requestReload());
   bindHoldButton(dom.btnSwap, () => requestSwap());
   bindHoldButton(dom.btnHeal, () => requestHeal());
+  bindHoldButton(dom.btnJump, () => requestJump());
+  bindHoldButton(dom.btnLoot, () => requestLoot());
+  bindHoldButton(
+    dom.btnCrouch,
+    () => {
+      state.touchCrouch = true;
+    },
+    () => {
+      state.touchCrouch = false;
+    },
+  );
+  bindHoldButton(dom.btnAim, () => toggleAds());
 
   window.addEventListener('resize', onResize);
   window.addEventListener('orientationchange', () => setTimeout(onResize, 120));
@@ -869,11 +1299,17 @@ function setupInput() {
 }
 
 function addLook(dx, dy) {
-  state.me.yaw -= dx * MOUSE_SENSITIVITY;
-  state.me.pitch -= dy * MOUSE_SENSITIVITY;
-  state.me.pitch = Math.max(-1.45, Math.min(1.45, state.me.pitch));
+  // 정조준 중에는 감도를 낮춰 정밀 조준이 가능하게 한다.
+  const sens = MOUSE_SENSITIVITY * (state.me.ads ? state.config?.adsSensitivity || 0.55 : 1);
+  state.me.yaw -= dx * sens;
+  state.me.pitch -= dy * sens;
+  state.me.pitch = Math.max(-PITCH_LIMIT, Math.min(PITCH_LIMIT, state.me.pitch));
   if (state.me.yaw > Math.PI) state.me.yaw -= Math.PI * 2;
   if (state.me.yaw < -Math.PI) state.me.yaw += Math.PI * 2;
+}
+
+function isPaused() {
+  return !isTouch && !dom.pause.classList.contains('hidden');
 }
 
 function requestLock(fromGesture = true) {
@@ -889,9 +1325,18 @@ function requestLock(fromGesture = true) {
   if (promise && typeof promise.catch === 'function') {
     promise.catch(() => {
       // 참여 직후처럼 사용자 제스처가 없을 때의 자동 잠금은 실패해도 대체 모드로 단정하지 않는다.
-      // (제스처에서 시도했는데 거절됐을 때만 '드래그 모드'로 안내한다.)
       if (fromGesture) onLockUnavailable();
     });
+  }
+  // 잠금 요청이 아무 응답 없이 실패하는 브라우저도 있다 → 시간이 지나면 드래그 모드로 넘어간다.
+  if (fromGesture) {
+    window.clearTimeout(state.lockTimer);
+    state.lockTimer = window.setTimeout(() => {
+      state.lockTimer = 0;
+      if (state.phase === 'playing' && !isTouch && document.pointerLockElement !== dom.canvas && state.me.alive) {
+        onLockUnavailable();
+      }
+    }, LOCK_TIMEOUT_MS);
   }
 }
 
@@ -912,9 +1357,9 @@ function resumeFromPause() {
     // 브라우저가 잠금을 거절하면 다시 안내를 보여 준다(조용히 실패하지 않게).
     window.setTimeout(() => {
       if (!state.lockUnavailable && state.phase === 'playing' && !document.pointerLockElement) {
-        showPause('조준 고정 실패', '브라우저가 마우스 고정을 거절했습니다. 다시 눌러 보거나 ESC 뒤 캔버스를 클릭해 주세요.');
+        showPause('조준 고정 실패', '브라우저가 마우스 고정을 거절했습니다. 화면을 드래그하면 조준이 되고, 다시 눌러 고정할 수도 있습니다.');
       }
-    }, 400);
+    }, 500);
   }
 }
 
@@ -926,10 +1371,11 @@ function onLockUnavailable() {
   if (state.lockUnavailable) return;
   state.lockUnavailable = true;
   dom.pauseTitle.textContent = '조준 방식 안내';
-  dom.pauseText.textContent = '이 브라우저에서는 마우스 고정을 쓸 수 없습니다. 화면을 드래그해 시점을 돌리고, 클릭으로 사격하세요.';
+  dom.pauseText.textContent = '이 브라우저에서는 마우스 고정을 쓸 수 없습니다. 화면을 누른 채 드래그해 시점을 돌리고, 클릭으로 사격하세요.';
   dom.btnResume.textContent = '계속하기';
   dom.pauseHint.textContent = '게임은 그대로 플레이할 수 있습니다.';
   dom.pause.classList.add('hidden');
+  showToast('드래그 조준 모드 — 마우스를 누른 채 끌면 시점이 돌아갑니다.');
 }
 
 function onResize() {
@@ -952,6 +1398,27 @@ function currentWeapon() {
   return state.config.weapons[state.me.weapon] || null;
 }
 
+/** 정조준(ADS) 켜기/끄기. 무기별 화각·감도·탄퍼짐이 함께 바뀐다. */
+function setAds(on) {
+  const want = Boolean(on) && state.phase === 'playing' && state.me.alive && state.round && state.round.state === 'live';
+  if (want === state.me.ads) return;
+  state.me.ads = want;
+  if (want) {
+    state.firing = false;
+    audio.adsIn();
+  } else {
+    audio.adsOut();
+  }
+  dom.adsOverlay.classList.toggle('active', want);
+  dom.crosshair.classList.toggle('ads', want);
+  dom.btnAim?.classList.toggle('active', state.adsToggle && want);
+}
+
+function toggleAds() {
+  state.adsToggle = !state.adsToggle;
+  setAds(state.adsToggle);
+}
+
 function attemptShoot(now) {
   if (!canPlay()) return;
   // 배틀로얄: 라운드가 진행 중일 때만 사격할 수 있다(대기/인터미션 중에는 워밍업).
@@ -972,7 +1439,34 @@ function attemptShoot(now) {
   audio.shoot(weapon.key);
   dom.crosshair.classList.add('firing');
   window.setTimeout(() => dom.crosshair.classList.remove('firing'), 90);
-  net.send({ t: 'shoot', yaw: state.me.yaw, pitch: state.me.pitch });
+
+  // 반동: 위로 튀고 좌우로 조금 흔들린다(정조준·앉기 중에는 줄어든다).
+  const kick = (weapon.recoilPitch ?? 0.008) * (state.me.ads ? 0.62 : 1) * (state.me.crouch ? 0.8 : 1);
+  const sway = (weapon.recoilYaw ?? 0.002) * (Math.random() * 2 - 1);
+  state.me.pitch = Math.min(PITCH_LIMIT, state.me.pitch + kick);
+  state.me.yaw += sway;
+  state.viewKick = Math.min(0.09, state.viewKick + kick * 6);
+  state.bloom = Math.min(26, state.bloom + (weapon.bloom ?? 4) * (state.me.ads ? 0.4 : 1));
+
+  net.send({ t: 'shoot', yaw: state.me.yaw, pitch: state.me.pitch, ads: state.me.ads });
+}
+
+function requestJump() {
+  if (!canPlay() || isPaused()) return;
+  if (!state.me.grounded) return;
+  const air = state.config?.jumpVelocity ?? 9;
+  state.me.vy = air;
+  state.me.grounded = false;
+  audio.jump();
+  net.send({ t: 'jump' });
+}
+
+function requestLoot() {
+  if (!canPlay() || isPaused()) return;
+  const now = performance.now();
+  if (now - state.lastLootAt < 400) return;
+  state.lastLootAt = now;
+  net.send({ t: 'loot' });
 }
 
 function requestReload() {
@@ -1006,6 +1500,86 @@ function requestHeal() {
   net.send({ t: 'heal' });
 }
 
+/* ── 수직 물리(클라이언트 예측) ──────────────────────────── */
+/** (x,z) 아래에서 발을 딛을 수 있는 높이(바닥 0, 엄폐물 윗면). 서버 supportAt 과 같은 규칙. */
+function supportAtLocal(x, z, prevY) {
+  let support = 0;
+  if (!state.map) return 0;
+  const margin = 0.225;
+  for (const cover of state.map.covers) {
+    if (cover.h > prevY + 0.32) continue;
+    const halfW = cover.w / 2;
+    const halfD = cover.d / 2;
+    if (x < cover.x - halfW - margin || x > cover.x + halfW + margin) continue;
+    if (z < cover.z - halfD - margin || z > cover.z + halfD + margin) continue;
+    if (cover.h > support) support = cover.h;
+  }
+  return support;
+}
+
+function stepVertical(dt) {
+  const me = state.me;
+  const cfg = state.config;
+  const gravity = cfg?.gravity ?? 20;
+  const prevY = me.y;
+  const wasGrounded = me.grounded;
+  me.vy -= gravity * dt;
+  if (me.vy < -MAX_FALL_SPEED) me.vy = -MAX_FALL_SPEED;
+  let nextY = prevY + me.vy * dt;
+  const support = supportAtLocal(me.x, me.z, prevY);
+  if (nextY <= support && me.vy <= 0) {
+    if (!wasGrounded && prevY - support > 0.15) {
+      state.landDip = Math.min(0.18, Math.abs(me.vy) * 0.014);
+      audio.land(Math.abs(me.vy));
+    }
+    nextY = support;
+    me.vy = 0;
+    me.grounded = true;
+  } else {
+    me.grounded = false;
+  }
+  me.y = nextY;
+}
+
+/** 줍기 힌트 + 자동 줍기 + 보급 상자 마커 표시 */
+function updateLoot(now) {
+  const cfg = state.config;
+  if (!cfg || !Array.isArray(cfg.loot)) return;
+  const me = state.me;
+  const range = cfg.lootRange ?? 2.8;
+  let best = null;
+  let bestDist = range;
+  for (const item of cfg.loot) {
+    const ready = state.items.get(item.id) !== false;
+    const mesh = state.lootMeshes?.get(item.id);
+    if (mesh) mesh.visible = ready;
+    if (!ready) continue;
+    const d = Math.hypot(item.x - me.x, item.z - me.z);
+    if (d <= bestDist) {
+      best = item;
+      bestDist = d;
+    }
+  }
+  const show = Boolean(best) && state.phase === 'playing' && me.alive;
+  dom.lootHint.classList.toggle('hidden', !show);
+  if (best) {
+    dom.lootHint.textContent = `${LOOT_HINTS[best.kind] || '아이템'} 줍기 — F`;
+  }
+  state.lootOpen = show;
+  // 자동 줍기(옵션): 범위 안에 쓸 만한 아이템이 있으면 서버에 요청한다(서버가 효과/범위를 재판정).
+  if (show && state.autoPickup && me.alive && now - state.lastLootAt > 700) {
+    state.lastLootAt = now;
+    net.send({ t: 'loot' });
+  }
+}
+
+const LOOT_HINTS = {
+  weapon: '샷건',
+  ammo: '탄약',
+  kit: '힐 키트',
+  medkit: '구급상자',
+};
+
 /* ── 네트워크 처리 ────────────────────────────────────────── */
 function setupNet() {
   net.on('welcome', onWelcome);
@@ -1014,6 +1588,10 @@ function setupNet() {
   net.on('corr', (msg) => {
     state.me.x = msg.x;
     state.me.z = msg.z;
+    if (Number.isFinite(msg.y)) {
+      state.me.y = msg.y;
+      state.me.vy = 0;
+    }
   });
   net.on('reloadStart', (msg) => {
     if (msg && msg.weapon && msg.weapon !== state.me.weapon) return;
@@ -1037,6 +1615,26 @@ function setupNet() {
     audio.heal();
     state.me.hp = msg.hp;
     state.me.kits = msg.kits;
+  });
+  net.on('looted', (msg) => {
+    audio.loot();
+    if (msg.text) showToast(msg.text);
+    if (Number.isFinite(msg.kits)) state.me.kits = msg.kits;
+    if (Number.isFinite(msg.hp)) state.me.hp = msg.hp;
+    if (Number.isFinite(msg.mag)) state.me.mag = msg.mag;
+    if (msg.reserve) state.me.reserve = msg.reserve[state.me.weapon] ?? state.me.reserve;
+    if (msg.owned) state.owned = msg.owned;
+    if (Number.isFinite(msg.weapon) && msg.weapon !== state.me.weapon) {
+      state.me.weapon = msg.weapon;
+      setViewmodel(msg.weapon);
+    }
+    state.items.set(msg.itemId, false);
+  });
+  net.on('toast', (msg) => {
+    if (msg && msg.text) showToast(msg.text);
+  });
+  net.on('noWeapon', (msg) => {
+    showToast(`${state.config?.weapons?.[msg.weapon]?.name || '그 무기'}은(는) 아직 없습니다. 맵에서 주우세요.`);
   });
   net.on('dry', (msg) => {
     audio.dry();
@@ -1074,11 +1672,15 @@ function onWelcome(msg) {
     state.map = msg.map;
     if (scene) buildWorld(msg.map);
   }
+  if (scene) buildLootMarkers();
   buildWeaponSlots();
 
   const spawn = msg.map?.spawns?.[0];
   // 위치는 첫 스냅샷(서버 권위)으로 확정한다.
   state.needSnap = true;
+  state.me.y = 0;
+  state.me.vy = 0;
+  state.me.grounded = true;
   if (spawn) {
     state.me.x = spawn.x;
     state.me.z = spawn.z;
@@ -1087,6 +1689,7 @@ function onWelcome(msg) {
   const weapon = currentWeapon();
   setViewmodel(state.me.weapon || 1);
   if (weapon) state.me.mag = weapon.mag;
+  if (msg.config?.ownedAtStart) state.owned = { ...msg.config.ownedAtStart };
 
   setLoading(false);
   audio.resume();
@@ -1095,6 +1698,8 @@ function onWelcome(msg) {
     if (document.pointerLockElement !== dom.canvas) {
       dom.pause.classList.remove('hidden');
     }
+  } else {
+    showToast(isTouch ? '왼쪽 조이스틱 이동 · 오른쪽 화면 드래그 조준' : '');
   }
 }
 
@@ -1105,10 +1710,17 @@ function onSnapshot(snap) {
   const now = performance.now();
   const seen = new Set();
 
+  if (Array.isArray(snap.items)) {
+    state.items.clear();
+    for (const [id, readyFlag] of snap.items) state.items.set(id, readyFlag === 1);
+  }
+
   for (const entry of snap.players) {
-    const [id, name, x, , z, yaw, pitch, hp, aliveFlag, weapon, mag, reserve, kills, deaths, protectFlag, reloadMs, kits] = entry;
+    const [id, name, x, y, z, yaw, pitch, hp, aliveFlag, weapon, mag, reserve, kills, deaths, protectFlag, reloadMs, kits, flagBits] = entry;
     seen.add(id);
     const alive = aliveFlag === 1;
+    const flags = flagBits || 0;
+    const isBot = (flags & 16) !== 0;
 
     if (id === state.myId) {
       const me = state.me;
@@ -1131,34 +1743,54 @@ function onSnapshot(snap) {
       if (state.needSnap) {
         state.needSnap = false;
         me.x = x;
+        me.y = y;
         me.z = z;
         me.yaw = yaw;
         me.pitch = pitch;
         me.alive = alive;
+        me.vy = 0;
       }
 
       if (!wasAlive && alive) {
         me.x = x;
+        me.y = y;
         me.z = z;
         me.yaw = yaw;
         me.pitch = pitch;
         me.reloadMs = 0;
+        me.vy = 0;
+        me.grounded = true;
+      }
+      // 지상에서는 서버 높이를 기준으로 부드럽게 맞추고, 공중에서는 예측을 존중하되 크게 어긋나면 스냅한다.
+      if (me.alive && !state.needSnap) {
+        const dy = y - me.y;
+        if (me.grounded && Math.abs(dy) < 0.6) me.y += dy * 0.5;
+        else if (Math.abs(dy) > 1.2) {
+          me.y = y;
+          me.vy = 0;
+        }
       }
       if (wasAlive && !alive) {
         state.firing = false;
+        state.me.ads = false;
+        dom.adsOverlay.classList.remove('active');
         cancelLocalReload();
       }
     } else {
       let avatar = state.avatars.get(id);
-      if (!avatar) avatar = createAvatar(id, name);
+      if (!avatar) avatar = createAvatar(id, name, isBot);
       avatar.lastSeen = now;
       if (avatar.weapon !== weapon) {
         avatar.weapon = weapon;
         applyRemoteWeapon(avatar, weapon);
       }
+      if (avatar.hp !== hp) {
+        avatar.hp = hp;
+        updateAvatarHealth(avatar, hp);
+      }
       if (alive) {
         avatar.group.visible = true;
-        pushSample(avatar, x, z, yaw, pitch, now);
+        pushSample(avatar, x, y, z, yaw, pitch, now);
       } else {
         avatar.group.visible = false;
         avatar.buffer.length = 0;
@@ -1192,8 +1824,10 @@ function onEvents(msg) {
       }
       case 'hit': {
         if (ev.by === state.myId) {
-          showHitmarker(false);
-          audio.hitmarker();
+          showHitmarker(Boolean(ev.head));
+          spawnDamageNumber(ev.dmg, Boolean(ev.head));
+          if (ev.head) audio.headshot();
+          else audio.hitmarker();
         }
         if (ev.id === state.myId) {
           flashDamage();
@@ -1206,6 +1840,7 @@ function onEvents(msg) {
         if (ev.killerId === state.myId) {
           showHitmarker(true);
           audio.kill();
+          showKillBanner(false, ev.headshot);
         }
         if (ev.victimId === state.myId) {
           state.firing = false;
@@ -1214,8 +1849,22 @@ function onEvents(msg) {
         }
         break;
       }
+      case 'jump':
+        if (ev.id !== state.myId && distanceToMe([ev.x, 0, ev.z]) < 40) {
+          // 다른 사람 점프: 가까운 거리에서만 발소리 느낌을 낸다.
+          audio.footstep(1);
+        }
+        break;
+      case 'land':
+        if (ev.id === state.myId) break;
+        break;
+      case 'loot': {
+        if (ev.by !== state.myId) addKillFeed({ k: 'loot', victim: ev.name });
+        state.items.set(ev.id, false);
+        break;
+      }
       case 'join':
-        if (ev.id !== state.myId) addKillFeed({ k: 'join', victim: ev.name });
+        if (ev.id !== state.myId) addKillFeed({ k: 'join', victim: ev.name, bot: ev.bot });
         break;
       case 'leave':
         addKillFeed({ k: 'leave', victim: ev.name });
@@ -1258,6 +1907,7 @@ function onEvents(msg) {
     }
   }
 }
+
 
 function distanceToMe(point) {
   if (!point) return 0;
@@ -1325,6 +1975,17 @@ function updateHud() {
   }
   for (const el of dom.weaponSlots.children) {
     el.classList.toggle('active', Number(el.dataset.weapon) === me.weapon);
+  }
+
+  // 자세 표시(정조준/앉기/달리기/공중)
+  if (dom.stanceBadge) {
+    const tags = [];
+    if (me.ads) tags.push('정조준');
+    if (!me.grounded) tags.push('공중');
+    else if (me.crouch) tags.push('앉기');
+    else if (me.sprint) tags.push('달리기');
+    dom.stanceBadge.textContent = tags.join(' · ');
+    dom.stanceBadge.classList.toggle('hidden', tags.length === 0);
   }
 
   // 생존 / 라운드 (배틀로얄: 킬 목표 없음, 생존자 수가 곧 규칙)
@@ -1423,20 +2084,8 @@ function updateHud() {
     dom.resultCountdown.textContent = `${state.round.nextIn}초 후 자동으로 다음 라운드가 시작됩니다. 전원 부활·탄약·구역이 초기화됩니다. (${state.round.ready}/${state.round.total} 준비)`;
   }
 
-  // 라운드가 진행 중인데 마우스 고정이 풀려 있으면(결과 창·ESC) 재고정 버튼을 띄운다.
-  if (
-    state.phase === 'playing' &&
-    !isTouch &&
-    !state.lockUnavailable &&
-    me.alive &&
-    roundState === 'live' &&
-    !resultOpen &&
-    document.pointerLockElement !== dom.canvas &&
-    dom.pause.classList.contains('hidden') &&
-    performance.now() > state.suppressPauseUntil
-  ) {
-    showPause('조준 다시 고정', '라운드가 진행 중입니다. 계속하려면 마우스를 다시 고정하세요.');
-  }
+  // 결과 화면에서 포인터 잠금을 푼 상태를 HUD 갱신이 stale pause로 다시 띄우지 않는다.
+  // 실제 잠금 해제는 pointerlockchange, 재고정 실패는 resumeFromPause에서 안내한다.
 
   dom.ping.textContent = net.rtt ? `${net.rtt}ms` : '--ms';
 }
@@ -1467,9 +2116,12 @@ function addKillFeed(ev) {
   item.className = 'kf-item';
 
   if (ev.k === 'join') {
-    item.textContent = `${ev.victim} 님이 입장했습니다.`;
+    item.textContent = `${ev.victim} 님이 입장했습니다.${ev.bot ? ' (AI)' : ''}`;
   } else if (ev.k === 'leave') {
     item.textContent = `${ev.victim} 님이 퇴장했습니다.`;
+  } else if (ev.k === 'loot') {
+    item.textContent = `${ev.victim} 님이 보급을 획득했습니다.`;
+    item.classList.add('loot');
   } else {
     const weaponLabel = WEAPON_LABELS[ev.weapon] || ev.weapon || '';
     if (ev.killer) {
@@ -1479,7 +2131,7 @@ function addKillFeed(ev) {
       killer.textContent = ev.killer;
       const w = document.createElement('span');
       w.className = 'kf-weapon';
-      w.textContent = `[${weaponLabel}]`;
+      w.textContent = `[${weaponLabel}]${ev.headshot ? ' 헤드' : ''}`;
       const victim = document.createElement('span');
       victim.className = 'kf-victim';
       victim.textContent = ev.victim;
@@ -1513,7 +2165,24 @@ function setupMenu() {
   const savedName = localStorage.getItem('3dfp.name') || '';
   if (savedName) dom.nameInput.value = savedName;
 
-  const tryJoin = async ({ create = false, code = null } = {}) => {
+  // 자동 줍기 옵션(기본 켜짐) — 서버가 범위/효과를 다시 판정하므로 안전하다.
+  const savedAuto = localStorage.getItem('3dfp.autoPickup');
+  state.autoPickup = savedAuto === null ? true : savedAuto === '1';
+  if (dom.autoPickup) {
+    dom.autoPickup.checked = state.autoPickup;
+    dom.autoPickup.addEventListener('change', () => {
+      state.autoPickup = dom.autoPickup.checked;
+      localStorage.setItem('3dfp.autoPickup', state.autoPickup ? '1' : '0');
+    });
+  }
+
+  const botSetup = () => ({
+    bots: Math.max(0, Math.min(7, Number(dom.botCount?.value) || 0)),
+    fillBots: Boolean(dom.botFill?.checked),
+    difficulty: dom.botDifficulty?.value || 'normal',
+  });
+
+  const tryJoin = async ({ create = false, code = null, bots = 0, fillBots = false, difficulty = 'normal' } = {}) => {
     hideMenuError();
     if (!net.connected) {
       setLoading(true, '서버에 연결 중…');
@@ -1529,7 +2198,13 @@ function setupMenu() {
     if (name) localStorage.setItem('3dfp.name', name);
     setLoading(true, create ? '방을 만드는 중…' : '방에 참여하는 중…');
     state.phase = 'connecting';
-    net.send({ t: 'join', name, create, code });
+    const payload = { t: 'join', name, create, code };
+    if (create) {
+      payload.bots = bots;
+      payload.fillBots = fillBots;
+      payload.difficulty = difficulty;
+    }
+    net.send(payload);
     // 응답이 없으면 8초 뒤 되돌린다.
     window.setTimeout(() => {
       if (state.phase === 'connecting') {
@@ -1554,7 +2229,13 @@ function setupMenu() {
 
   dom.btnCreate.addEventListener('click', () => {
     audio.uiClick();
-    tryJoin({ create: true });
+    tryJoin({ create: true, ...botSetup() });
+  });
+
+  // AI 연습: 봇 3명(보통)과 바로 시작하는 방을 만든다.
+  dom.btnAi.addEventListener('click', () => {
+    audio.uiClick();
+    tryJoin({ create: true, bots: 3, fillBots: false, difficulty: 'normal' });
   });
 
   dom.codeInput.addEventListener('keydown', (e) => {
@@ -1592,6 +2273,7 @@ let lastMoveSend = 0;
 
 function moveLocal(dt) {
   const me = state.me;
+  const cfg = state.config;
   let mx = 0;
   let mz = 0;
 
@@ -1605,14 +2287,25 @@ function moveLocal(dt) {
     mz -= state.touchMove.y;
   }
 
+  // 자세/달리기 상태를 입력에서 계산한다(서버에 함께 보내 탄퍼짐·속도·피격 박스에 쓰인다).
+  me.crouch = Boolean(state.keys.has('KeyC') || state.keys.has('ControlLeft') || state.touchCrouch);
+  const shiftHeld = state.keys.has('ShiftLeft') || state.keys.has('ShiftRight');
+
   const len = Math.hypot(mx, mz);
+  me.sprint = Boolean(shiftHeld && !me.crouch && !me.ads && len > 0.1);
   if (len < 0.02) return false;
   if (len > 1) {
     mx /= len;
     mz /= len;
   }
 
-  const speed = state.config ? state.config.maxSpeed : 6;
+  const base = cfg ? cfg.maxSpeed : 6;
+  let speed = base;
+  if (me.sprint) speed *= cfg?.sprintMultiplier ?? 1.28;
+  if (me.crouch) speed *= cfg?.crouchMultiplier ?? 0.55;
+  if (me.ads) speed *= cfg?.adsMultiplier ?? 0.72;
+  state.speedRatio = speed / base;
+
   const sin = Math.sin(me.yaw);
   const cos = Math.cos(me.yaw);
   // 전방 = (-sin, -cos), 오른쪽 = (cos, -sin)
@@ -1625,6 +2318,8 @@ function moveLocal(dt) {
   if (state.map) {
     for (let pass = 0; pass < 2; pass += 1) {
       for (const cover of state.map.covers) {
+        // 엄폐물 위(발이 윗면 이상)에 있으면 측면 충돌을 무시한다(위로 올라서거나 지나갈 수 있다).
+        if (me.y >= cover.h - 0.05) continue;
         const halfW = cover.w / 2;
         const halfD = cover.d / 2;
         const minX = cover.x - halfW;
@@ -1662,42 +2357,107 @@ function animate() {
   if (!renderer || !scene || !camera) return;
 
   if (state.phase === 'playing') {
-    const paused = !isTouch && !dom.pause.classList.contains('hidden');
-    if (state.me.alive && !paused && !state.needSnap) {
+    const paused = isPaused();
+    const me = state.me;
+    state.movingNow = false;
+
+    if (me.alive && !paused && !state.needSnap) {
       const moving = moveLocal(dt);
-      if (moving && now - state.lastStepAt > 420) {
+      state.movingNow = moving;
+      stepVertical(dt);
+      if (moving && me.grounded && now - state.lastStepAt > (me.sprint ? 300 : 420)) {
         state.lastStepAt = now;
-        audio.footstep(Math.floor(now / 420));
+        audio.footstep(Math.floor(now / (me.sprint ? 300 : 420)));
       }
+    } else if (!me.alive && !state.needSnap) {
+      me.y = 0;
+      me.vy = 0;
+      me.grounded = true;
     }
 
-    camera.position.set(state.me.x, state.me.y + (state.config ? state.config.eyeHeight : 1.62), state.me.z);
-    camera.rotation.y = state.me.yaw;
-    camera.rotation.x = state.me.pitch;
+    // 정조준은 라운드 중·생존 상태에서만 유지된다.
+    if (me.ads && !canPlay()) setAds(false);
+    // 달리기/앉기 중에는 정조준을 풀지 않고, 정조준 중 달리기는 입력에서 막혔다.
+
+    // ── 카메라(눈높이·봅·착지 딥·화각) ──
+    const eyeTarget = me.crouch ? (state.config?.crouchEyeHeight ?? 1.02) : (state.config?.eyeHeight ?? 1.62);
+    me.eye += (eyeTarget - me.eye) * Math.min(1, dt * 14);
+    state.landDip += (0 - state.landDip) * Math.min(1, dt * 9);
+    state.viewKick += (0 - state.viewKick) * Math.min(1, dt * 15);
+
+    const bobSpeed = 8.2 * (me.sprint ? 1.35 : 1);
+    if (state.movingNow && me.grounded) state.bobT += dt * bobSpeed;
+    const bobAmp = (me.ads ? 0.3 : 1) * (state.movingNow && me.grounded ? 1 : 0);
+    const bobY = Math.sin(state.bobT * 2) * 0.013 * bobAmp;
+    const bobX = Math.cos(state.bobT) * 0.011 * bobAmp;
+
+    camera.position.set(me.x + bobX, me.y + me.eye + bobY - state.landDip, me.z);
+    camera.rotation.y = me.yaw;
+    camera.rotation.x = me.pitch;
+
+    const weapon = currentWeapon();
+    const targetFov = me.ads ? (weapon?.adsFov ?? 60) : (state.config?.baseFov ?? 78);
+    if (Math.abs(camera.fov - targetFov) > 0.04) {
+      camera.fov += (targetFov - camera.fov) * Math.min(1, dt * 13);
+      camera.updateProjectionMatrix();
+    }
+    me.fov = camera.fov;
+
+    // ── 1인칭 무기(정조준 중앙 정렬 · 봅 · 반동) ──
+    if (viewmodel) {
+      const g = viewmodel.group;
+      const k = Math.min(1, dt * 15);
+      const tx = me.ads ? 0 : 0.26;
+      const ty = (me.ads ? -0.125 : -0.24) + bobY * 2.2 - state.landDip * 0.4;
+      const tz = (me.ads ? -0.3 : -0.42) + state.viewKick;
+      g.position.x += (tx - g.position.x) * k;
+      g.position.y += (ty - g.position.y) * k;
+      g.position.z += (tz - g.position.z) * k;
+      g.rotation.x = state.viewKick * 2.2 + (me.sprint ? 0.06 : 0);
+      g.rotation.y = me.ads ? 0 : 0.02;
+      g.visible = me.alive;
+    }
 
     // 자동 사격
-    if (state.firing && state.me.alive && !paused) {
-      const weapon = currentWeapon();
-      if (weapon && weapon.auto) attemptShoot(now);
+    if (state.firing && me.alive && !paused) {
+      const autoWeapon = currentWeapon();
+      if (autoWeapon && autoWeapon.auto) attemptShoot(now);
     }
 
     // 이동 패킷 (20Hz) — 서버가 위치를 확정하기 전, 그리고 살아 있을 때만 보낸다.
-    if (state.me.alive && !state.needSnap && now - lastMoveSend >= 50) {
+    if (me.alive && !state.needSnap && now - lastMoveSend >= 50) {
       lastMoveSend = now;
-      net.send({ t: 'm', x: state.me.x, z: state.me.z, yaw: state.me.yaw, pitch: state.me.pitch });
+      net.send({
+        t: 'm',
+        x: state.me.x,
+        y: state.me.y,
+        z: state.me.z,
+        yaw: state.me.yaw,
+        pitch: state.me.pitch,
+        crouch: state.me.crouch,
+    keys: [...state.keys],
+        sprint: state.me.sprint,
+        ads: state.me.ads,
+      });
     }
 
-    // 원격 플레이어 보간
+    // 원격 플레이어 보간(y 포함 — 점프/엄폐물 위 이동이 그대로 보인다)
     const renderTime = now - VIEW_DELAY_MS;
     for (const avatar of state.avatars.values()) {
       if (!avatar.group.visible) continue;
       const sample = sampleAvatar(avatar, renderTime);
       if (!sample) continue;
-      avatar.group.position.set(sample.x, 0, sample.z);
+      avatar.group.position.set(sample.x, sample.y || 0, sample.z);
       avatar.group.rotation.y = sample.yaw;
       avatar.head.rotation.x = -sample.pitch;
       avatar.gun.rotation.x = -sample.pitch;
     }
+
+    updateLootSpinner(dt);
+    updateLoot(now);
+    updateCrosshair(dt);
+    drawCompass();
+    drawMinimap(now);
 
     // 존 시각화: 안·밖 어디서나 보이도록 벽을 은은하게 띄우고, 축소 중에는 색을 바꾼다.
     if (state.zone && zoneWall && zoneEdge) {
@@ -1726,6 +2486,7 @@ async function boot() {
   setupMenu();
   setupInput();
   setupNet();
+  setupSoundToggle();
 
   if (renderer) {
     try {
@@ -1735,6 +2496,8 @@ async function boot() {
       initMuzzleEffects();
       setViewmodel(1);
       animate();
+      // 지연 초기화 경고는 성공적으로 월드가 구성된 뒤에만 숨긴다.
+      document.getElementById('boot-error')?.classList.add('hidden');
     } catch (err) {
       console.error('[3dfp] 월드 구성 실패', err);
       showMenuError('맵을 불러오지 못했습니다. 새로 고침해 주세요.');
@@ -1746,10 +2509,40 @@ async function boot() {
     if (document.hidden) {
       state.keys.clear();
       state.firing = false;
+      state.dragLook = false;
     }
   });
 
-  // 부트스트랩이 끝났음은 index.html의 대기 감시(importmap/모듈 로드 실패 배너)에 알린다.
+  // 테스트/디버그용 읽기 전용 훅(값을 바꾸지 않는다).
+  window.__3dfpDebug = () => ({
+    phase: state.phase,
+    y: state.me.y,
+    vy: state.me.vy,
+    grounded: state.me.grounded,
+    ads: state.me.ads,
+    crouch: state.me.crouch,
+    keys: [...state.keys],
+    sprint: state.me.sprint,
+    fov: camera ? camera.fov : 0,
+    eye: state.me.eye,
+    yaw: state.me.yaw,
+    pitch: state.me.pitch,
+    weapon: state.me.weapon,
+    owned: state.owned,
+    kits: state.me.kits,
+    hp: state.me.hp,
+    lootOpen: state.lootOpen,
+    loot: state.config ? state.config.loot : [],
+    lootRange: state.config ? state.config.lootRange : 0,
+    muted: state.muted,
+    lockUnavailable: state.lockUnavailable,
+    locked: document.pointerLockElement === dom.canvas,
+    bots: state.round ? state.round.bots : 0,
+    total: state.round ? state.round.total : 0,
+  });
+  window.__3dfpLockMode = () => (state.lockUnavailable ? 'drag' : document.pointerLockElement ? 'locked' : 'idle');
+
+  // 부트스트랩이 끝났음은 index.html의 대기 경보(importmap/모듈 로드 실패 배너)에 알린다.
   window.__3dfpBooted = true;
 }
 

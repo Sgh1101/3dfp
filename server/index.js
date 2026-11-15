@@ -313,6 +313,12 @@ wss.on('connection', (ws) => {
       case 'm':
         game.handleMove(client.id, msg);
         break;
+      case 'jump':
+        game.handleJump(client.id);
+        break;
+      case 'loot':
+        game.handleLoot(client.id);
+        break;
       case 'shoot':
         game.handleShoot(client.id, msg);
         break;
