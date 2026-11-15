@@ -50,6 +50,30 @@ body {
   display: none !important;
 }
 
+/* 부트 실패/지연 배너 (three 또는 main.js 모듈 로드 문제) */
+.boot-error {
+  position: fixed;
+  top: calc(12px + var(--safe-t));
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 90;
+  max-width: min(560px, 92vw);
+  padding: 10px 14px;
+  border-radius: 12px;
+  border: 1px solid rgba(248, 113, 113, 0.45);
+  background: rgba(40, 12, 12, 0.92);
+  color: #ffe4e4;
+  font-size: 13px;
+  line-height: 1.45;
+  text-align: center;
+}
+
+.boot-error b {
+  display: block;
+  color: #fca5a5;
+  margin-bottom: 2px;
+}
+
 #game {
   position: fixed;
   inset: 0;
@@ -169,6 +193,28 @@ body {
   align-items: flex-end;
   gap: 4px;
   max-width: 60vw;
+}
+
+/* 워밍업 배너(혼자 있을 때) — HUD 상단 중앙에 겹치지 않게 */
+.wait-banner {
+  position: absolute;
+  top: calc(84px + var(--safe-t));
+  left: 50%;
+  transform: translateX(-50%);
+  max-width: min(520px, 86vw);
+  padding: calc(var(--unit) * 0.5) calc(var(--unit) * 0.95);
+  border-radius: 999px;
+  border: 1px solid rgba(52, 211, 153, 0.28);
+  background: rgba(8, 14, 20, 0.82);
+  color: #cdeee0;
+  font-size: calc(var(--unit) * 0.82);
+  line-height: 1.35;
+  text-align: center;
+  backdrop-filter: blur(4px);
+}
+
+.wait-banner b {
+  color: var(--accent);
 }
 
 .kf-item {
@@ -429,6 +475,25 @@ body {
 
 #pause {
   background: rgba(4, 7, 11, 0.55);
+}
+
+/* 탈락(관전) 오버레이는 배경을 가리지 않는다 — 남은 플레이어를 볼 수 있어야 한다. */
+#dead {
+  background: none;
+  backdrop-filter: none;
+  align-items: flex-end;
+  padding-bottom: calc(40px + var(--safe-b));
+  pointer-events: none;
+}
+
+#dead .panel {
+  background: rgba(10, 16, 22, 0.85);
+  border-color: rgba(248, 113, 113, 0.35);
+}
+
+#dead h2 {
+  color: #fca5a5;
+  letter-spacing: 0.12em;
 }
 
 .panel {
@@ -780,6 +845,12 @@ input[type="text"]:focus {
   .killfeed {
     top: calc(74px + var(--safe-t));
     max-width: 52vw;
+  }
+
+  .wait-banner {
+    top: calc(112px + var(--safe-t));
+    font-size: calc(var(--unit) * 0.78);
+    padding: 5px 10px;
   }
 
   .round-kills,

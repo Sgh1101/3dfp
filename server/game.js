@@ -6,9 +6,12 @@
  * - 방 하나 = Game 인스턴스 하나. 20Hz(50ms) 틱으로 상태를 갱신하고 스냅샷을 만든다.
  * - 이동은 클라이언트 예측 + 서버 검증(속도 제한/좌표 범위/NaN) 방식이고,
  *   사격·피해·존·라운드는 전부 서버가 계산한다.
+ * - 라운드 규칙은 **배틀로얄(노리스폰)**: 라운드 중 사망한 플레이어는 라운드가 끝날 때까지 관전하고,
+ *   마지막 생존자가 승리한다. 라운드 사이(인터미션)에 전원이 alive/HP/탄약을 새로 받는다.
  */
 
 const { ARENA, COVERS, SPAWNS } = require('./map');
+const { RateLimiter } = require('./limits');
 
 // ── 상수 ────────────────────────────────────────────────────────────────────
 const TICK_MS = 50;
@@ -24,11 +27,12 @@ const HEAL_KITS = 2;
 const HEAL_AMOUNT = 35;
 const HEAL_COOLDOWN_MS = 1200;
 const SPAWN_PROTECT_MS = 10000;
-const RESPAWN_MS = 4000;
 
+// 배틀로얄: 라운드 중 리스폰 없음. 라운드 사이 인터미션에서만 되살아난다.
 const ROUND_MS = 180000;
-const KILL_TARGET = 15;
 const INTERMISSION_MS = 8000;
+/** 라운드를 시작하려면 이 인원이 필요하다(혼자면 워밍업 대기). */
+const MIN_PLAYERS_TO_START = 2;
 
 const START_RADIUS = 80;
 const ZONE_DPS = 12;
@@ -120,24 +124,7 @@ function sanitizeName(raw) {
   return name;
 }
 
-/** 초당/기간당 호출 횟수 제한(토큰 버킷 대용 슬라이딩 윈도) */
-class RateLimiter {
-  constructor(max, windowMs = 1000) {
-    this.max = max;
-    this.windowMs = windowMs;
-    this.windowStart = 0;
-    this.count = 0;
-  }
-
-  allow(now, weight = 1) {
-    if (now - this.windowStart >= this.windowMs) {
-      this.windowStart = now;
-      this.count = 0;
-    }
-    this.count += weight;
-    return this.count <= this.max;
-  }
-}
+/** 초당/기간당 호출 횟수 제한(토큰 버킷 대용 슬라이딩 윈도)은 server/limits.js 의 RateLimiter를 쓴다. */
 
 /** 슬랩(slab) 방식 레이-AABB 교차. 진입 거리(t>=0)를 반환하고, 빗나가면 null. */
 function rayAABB(ox, oy, oz, dx, dy, dz, minX, minY, minZ, maxX, maxY, maxZ, maxDist) {
@@ -250,12 +237,16 @@ class Game {
     this.resetZone(Date.now());
 
     this.round = {
-      index: 1,
-      state: 'live', // live | ended
-      startedAt: Date.now(),
-      endsAt: Date.now() + ROUND_MS,
+      index: 0,
+      state: 'waiting', // waiting(인원 부족 워밍업) | live | ended(인터미션)
+      startedAt: 0,
+      endsAt: 0,
       winner: null,
       nextRoundAt: 0,
+      /** 라운드 시작 시점 인원(2명 이상일 때만 마지막 생존자 승리 판정) */
+      startedWith: 0,
+      /** 종료 사유: last-survivor | timeout | wipe */
+      reason: null,
     };
   }
 
@@ -361,6 +352,7 @@ class Game {
       mag: {},
       reserve: {},
       reloadEnd: 0,
+      reloadWeapon: 0,
       nextShotAt: 0,
       nextHealAt: 0,
       kits: HEAL_KITS,
@@ -369,6 +361,8 @@ class Game {
       ready: false,
       spawnProtectUntil: now + SPAWN_PROTECT_MS,
       respawnAt: 0,
+      /** 라운드 진행 중에 들어와 다음 라운드까지 기다리는 관전자 */
+      spectator: false,
       lastMoveAt: now,
       lastZoneDamageAt: 0,
       lastStepAt: 0,
@@ -384,9 +378,17 @@ class Game {
       player.mag[key] = WEAPONS[key].mag;
       player.reserve[key] = WEAPONS[key].reserve;
     }
+    // 진행 중인 라운드에 새로 들어온 플레이어는 탈락 상태로 관전하고, 다음 라운드에 합류한다.
+    if (this.round.state === 'live') {
+      player.alive = false;
+      player.hp = 0;
+      player.spectator = true;
+    }
     this.players.set(id, player);
     this.lastActivityAt = now;
     this.pushEvent({ k: 'join', id, name: player.name });
+    // 혼자서는 라운드가 시작되지 않고, 두 번째 플레이어가 들어오면 바로 배틀로얄을 시작한다.
+    if (this.round.state === 'waiting') this.tryStartRound(now);
     return player;
   }
 
@@ -396,6 +398,10 @@ class Game {
     this.players.delete(id);
     this.lastActivityAt = Date.now();
     this.pushEvent({ k: 'leave', id, name: player.name });
+    // 상대가 나가 1명만 남으면 라운드를 계속할 수 없다 → 워밍업으로 돌린다.
+    if (this.round.state === 'live' && this.players.size < MIN_PLAYERS_TO_START) {
+      this.goWaiting(Date.now());
+    }
     return player;
   }
 
@@ -415,11 +421,13 @@ class Game {
       player.reserve[key] = WEAPONS[key].reserve;
     }
     player.reloadEnd = 0;
+    player.reloadWeapon = 0;
     player.nextShotAt = 0;
     player.nextHealAt = 0;
     player.kits = HEAL_KITS;
     player.spawnProtectUntil = now + SPAWN_PROTECT_MS;
     player.respawnAt = 0;
+    player.spectator = false;
     player.lastMoveAt = now;
     player.lastZoneDamageAt = 0;
     player.ready = false;
@@ -597,7 +605,9 @@ class Game {
       target.hp = 0;
       target.alive = false;
       target.deaths += 1;
-      target.respawnAt = now + RESPAWN_MS;
+      target.respawnAt = 0; // 배틀로얄: 라운드 중 리스폰 없음(라운드 종료 후 일괄 부활)
+      target.reloadEnd = 0;
+      target.reloadWeapon = 0;
       target.ready = false;
       if (attacker && attacker.id !== target.id) attacker.kills += 1;
       this.pushEvent({
@@ -625,8 +635,18 @@ class Game {
       return;
     }
     player.reloadEnd = now + weapon.reloadMs;
+    player.reloadWeapon = player.weapon;
     this.pushDirect(player.id, { t: 'reloadStart', weapon: player.weapon, ms: weapon.reloadMs });
     this.pushEvent({ k: 'reload', id: player.id, weapon: player.weapon, ms: weapon.reloadMs });
+  }
+
+  /** 재장전 취소(무기 교체·사망 시). 진행 중이던 타이머를 즉시 버린다. */
+  cancelReload(player) {
+    const wasReloading = player.reloadEnd > Date.now();
+    player.reloadEnd = 0;
+    player.reloadWeapon = 0;
+    if (wasReloading) this.pushDirect(player.id, { t: 'reloadCancel', weapon: player.weapon });
+    return wasReloading;
   }
 
   finishReload(player) {
@@ -652,7 +672,8 @@ class Game {
     }
     if (next === player.weapon) return;
     player.weapon = next;
-    player.reloadEnd = 0;
+    // 무기 교체 시 이전 무기의 재장전은 즉시 취소한다(새 무기에 완료가 얹히지 않도록).
+    this.cancelReload(player);
     player.nextShotAt = Math.max(player.nextShotAt, now + 250);
     this.pushEvent({ k: 'swap', id, weapon: next });
   }
@@ -679,70 +700,149 @@ class Game {
     const player = this.players.get(id);
     if (!player) return;
     if (this.round.state === 'live') return;
+    const now = Date.now();
     player.ready = true;
     this.pushEvent({ k: 'ready', id, name: player.name });
     let allReady = true;
     for (const p of this.players.values()) {
       if (!p.ready) allReady = false;
     }
-    if (allReady && this.players.size > 0) this.startRound(Date.now());
+    // 전원 준비되면 인터미션을 기다리지 않고 바로 다음 라운드를 시작한다.
+    if (allReady && this.players.size >= MIN_PLAYERS_TO_START) {
+      this.round.nextRoundAt = 0;
+      this.startRound(now);
+    }
   }
 
-  // ── 라운드 ──
+  // ── 라운드(배틀로얄) ──
+  /** 인원이 모자라 라운드를 시작할 수 없을 때의 워밍업 상태로 되돌린다. */
+  goWaiting(now) {
+    this.round.state = 'waiting';
+    this.round.startedAt = 0;
+    this.round.endsAt = 0;
+    this.round.nextRoundAt = 0;
+    this.round.winner = null;
+    this.round.startedWith = 0;
+    this.resetZone(now);
+    for (const player of this.players.values()) this.resetPlayer(player, now, true);
+    this.pushEvent({
+      k: 'round',
+      phase: 'waiting',
+      index: this.round.index,
+      need: MIN_PLAYERS_TO_START,
+      total: this.players.size,
+    });
+  }
+
+  /** 대기 중이고 인원이 찼으면 라운드를 시작한다. */
+  tryStartRound(now) {
+    if (this.round.state !== 'waiting') return false;
+    if (this.players.size < MIN_PLAYERS_TO_START) return false;
+    this.startRound(now);
+    return true;
+  }
+
   startRound(now) {
+    if (this.players.size < MIN_PLAYERS_TO_START) {
+      this.goWaiting(now);
+      return;
+    }
     this.round.index += 1;
     this.round.state = 'live';
+    this.round.reason = null;
     this.round.startedAt = now;
     this.round.endsAt = now + ROUND_MS;
     this.round.winner = null;
     this.round.nextRoundAt = 0;
+    this.round.startedWith = this.players.size;
     this.resetZone(now);
     for (const player of this.players.values()) {
       player.kills = 0;
       player.deaths = 0;
       this.resetPlayer(player, now, false);
     }
-    this.pushEvent({ k: 'round', phase: 'start', index: this.round.index });
+    this.pushEvent({
+      k: 'round',
+      phase: 'start',
+      index: this.round.index,
+      total: this.players.size,
+      timeMs: ROUND_MS,
+    });
   }
 
-  endRound(now) {
+  /**
+   * 라운드 종료. winner 는 마지막 생존자(또는 시간 종료 시 HP 우세자).
+   * @param {number} now
+   * @param {string|null} winnerId
+   * @param {'last-survivor'|'timeout'|'wipe'} reason
+   */
+  endRound(now, winnerId = null, reason = 'last-survivor') {
     if (this.round.state !== 'live') return;
     this.round.state = 'ended';
+    this.round.reason = reason;
     this.round.nextRoundAt = now + INTERMISSION_MS;
-    let best = null;
-    let tie = false;
-    for (const player of this.players.values()) {
-      if (!best || player.kills > best.kills) {
-        best = player;
-        tie = false;
-      } else if (best && player.kills === best.kills) {
-        tie = true;
-      }
-    }
-    const winner = best && best.kills > 0 && !tie ? { id: best.id, name: best.name, kills: best.kills } : null;
-    this.round.winner = winner;
+    const winner = winnerId ? this.players.get(winnerId) : null;
+    this.round.winner = winner
+      ? { id: winner.id, name: winner.name, kills: winner.kills, hp: Math.max(0, Math.round(winner.hp)) }
+      : null;
     this.pushEvent({
       k: 'round',
       phase: 'end',
       index: this.round.index,
+      reason,
       winner: winner ? winner.name : null,
+      winnerId: winner ? winner.id : null,
       kills: winner ? winner.kills : 0,
+      hp: winner ? Math.max(0, Math.round(winner.hp)) : 0,
       draw: !winner,
     });
   }
 
+  /** 생존자 중 HP가 가장 높은 사람(동점이면 킬 수) — 시간 종료 시 승자 결정 */
+  pickHpLeader() {
+    let best = null;
+    for (const player of this.players.values()) {
+      if (!player.alive) continue;
+      if (!best) {
+        best = player;
+        continue;
+      }
+      if (player.hp > best.hp) best = player;
+      else if (player.hp === best.hp && player.kills > best.kills) best = player;
+    }
+    return best;
+  }
+
   updateRound(now) {
     if (this.round.state === 'live') {
-      let reachedTarget = null;
-      for (const player of this.players.values()) {
-        if (player.kills >= KILL_TARGET) reachedTarget = player;
+      // 마지막 생존자 승리: 2명 이상으로 시작한 라운드에서 생존자가 1명(또는 0명)이 되면 종료.
+      if (this.round.startedWith >= MIN_PLAYERS_TO_START && this.aliveCount <= 1) {
+        let survivor = null;
+        for (const player of this.players.values()) {
+          if (player.alive) {
+            survivor = player;
+            break;
+          }
+        }
+        this.endRound(now, survivor ? survivor.id : null, survivor ? 'last-survivor' : 'wipe');
+        return;
       }
-      if (reachedTarget || now >= this.round.endsAt) {
-        this.endRound(now);
+      // 시간 종료: 남은 생존자 중 HP 우세자 승리(전멸이면 무승부).
+      if (now >= this.round.endsAt) {
+        const leader = this.pickHpLeader();
+        this.endRound(now, leader ? leader.id : null, 'timeout');
       }
-    } else if (this.round.state === 'ended' && this.round.nextRoundAt && now >= this.round.nextRoundAt) {
-      this.startRound(now);
+      return;
     }
+
+    if (this.round.state === 'ended' && this.round.nextRoundAt && now >= this.round.nextRoundAt) {
+      this.round.nextRoundAt = 0;
+      if (this.players.size >= MIN_PLAYERS_TO_START) this.startRound(now);
+      else this.goWaiting(now);
+      return;
+    }
+
+    if (this.round.state === 'waiting') this.tryStartRound(now);
   }
 
   // ── 틱 ──
@@ -751,23 +851,23 @@ class Game {
     this.updateZone(now);
 
     for (const player of this.players.values()) {
-      // 재장전 완료
+      // 재장전 완료: 재장전을 시작한 무기와 현재 무기가 같을 때만 탄창을 채운다.
       if (player.reloadEnd && now >= player.reloadEnd) {
+        const reloadedWeapon = player.reloadWeapon;
         player.reloadEnd = 0;
-        this.finishReload(player);
-        this.pushDirect(player.id, {
-          t: 'reloaded',
-          weapon: player.weapon,
-          mag: player.mag[player.weapon],
-          reserve: player.reserve[player.weapon],
-        });
+        player.reloadWeapon = 0;
+        if (reloadedWeapon && reloadedWeapon === player.weapon) {
+          this.finishReload(player);
+          this.pushDirect(player.id, {
+            t: 'reloaded',
+            weapon: player.weapon,
+            mag: player.mag[player.weapon],
+            reserve: player.reserve[player.weapon],
+          });
+        }
       }
 
-      // 사망 → 자동 리스폰
-      if (!player.alive && player.respawnAt && now >= player.respawnAt && this.round.state === 'live') {
-        this.resetPlayer(player, now, true);
-      }
-
+      // 배틀로얄: 라운드 중에는 절대 리스폰하지 않는다(라운드 종료 후 일괄 부활).
       // 존 밖 피해
       if (player.alive && this.round.state === 'live') {
         const dist = this.distanceToZoneCenter(player.x, player.z);
@@ -781,7 +881,9 @@ class Game {
               player.hp = 0;
               player.alive = false;
               player.deaths += 1;
-              player.respawnAt = now + RESPAWN_MS;
+              player.respawnAt = 0;
+              player.reloadEnd = 0;
+              player.reloadWeapon = 0;
               this.pushEvent({
                 k: 'kill',
                 killer: null,
@@ -870,13 +972,19 @@ class Game {
         nextIn: Math.round(this.zone.nextIn),
       },
       round: {
+        mode: 'br',
         index: this.round.index,
         state: this.round.state,
-        timeLeft: Math.max(0, Math.round((this.round.endsAt - now) / 1000)),
+        reason: this.round.reason,
+        timeLeft: this.round.state === 'live' ? Math.max(0, Math.round((this.round.endsAt - now) / 1000)) : 0,
         winner: this.round.winner ? this.round.winner.name : null,
+        winnerId: this.round.winner ? this.round.winner.id : null,
         winnerKills: this.round.winner ? this.round.winner.kills : 0,
+        winnerHp: this.round.winner ? this.round.winner.hp : 0,
         ready,
         total: this.players.size,
+        alive: this.aliveCount,
+        need: MIN_PLAYERS_TO_START,
         nextIn: this.round.state === 'ended' ? Math.max(0, Math.round((this.round.nextRoundAt - now) / 1000)) : 0,
       },
     };
@@ -948,10 +1056,12 @@ function publicConfig() {
     eyeHeight: EYE_HEIGHT,
     playerRadius: PLAYER_RADIUS,
     playerHeight: PLAYER_HEIGHT,
-    respawnMs: RESPAWN_MS,
+    respawnMs: 0, // 배틀로얄: 라운드 중 리스폰 없음
     spawnProtectMs: SPAWN_PROTECT_MS,
     roundMs: ROUND_MS,
-    killTarget: KILL_TARGET,
+    intermissionMs: INTERMISSION_MS,
+    minPlayers: MIN_PLAYERS_TO_START,
+    mode: 'br',
     healKits: HEAL_KITS,
     zonePhases: ZONE_PHASES,
     zoneDps: ZONE_DPS,
@@ -969,6 +1079,9 @@ module.exports = {
   MAX_SPEED,
   PLAYER_RADIUS,
   MAX_HP,
+  ROUND_MS,
+  INTERMISSION_MS,
+  MIN_PLAYERS_TO_START,
   sanitizeName,
   publicConfig,
   directionFromAngles,

@@ -3,7 +3,10 @@
 ## 코드 / 엔진
 
 - **Three.js** — MIT License · <https://threejs.org>
-  - 클라이언트 3D 렌더링. ES 모듈로 CDN에서 불러옵니다 (`three@0.170.0`, unpkg).
+  - 클라이언트 3D 렌더링. `three@0.170.0` ES 모듈 빌드(`three.module.min.js`)를
+    `public/vendor/three/`에 **로컬 번들**로 포함해 서비스한다(CDN 의존 없음, 오프라인 동작).
+  - 라이선스 원문: `public/vendor/three/LICENSE`, 버전 메모: `public/vendor/three/VERSION`
+  - 갱신: `npm install && npm run vendor:three`
 - **ws** — MIT License · <https://github.com/websockets/ws>
   - Node.js WebSocket 서버.
 - **Node.js** — MIT License · <https://nodejs.org>

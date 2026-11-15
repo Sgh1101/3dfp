@@ -32,7 +32,11 @@ const dom = {
   resultCountdown: document.getElementById('result-countdown'),
   btnReady: document.getElementById('btn-ready'),
   dead: document.getElementById('dead'),
+  deadTitle: document.getElementById('dead-title'),
   deadTimer: document.getElementById('dead-timer'),
+  deadHint: document.getElementById('dead-hint'),
+  waitBanner: document.getElementById('wait-banner'),
+  waitCount: document.getElementById('wait-count'),
   disconnected: document.getElementById('disconnected'),
   disconnectedReason: document.getElementById('disconnected-reason'),
   btnReconnect: document.getElementById('btn-reconnect'),
@@ -133,6 +137,7 @@ try {
   console.error('[3dfp] WebGL 초기화 실패', err);
   dom.menuError.textContent = '이 브라우저에서 WebGL을 사용할 수 없습니다.';
   dom.menuError.classList.remove('hidden');
+  window.showBootError?.('이 브라우저에서 WebGL을 사용할 수 없어 3D 화면을 열 수 없습니다.');
 }
 
 if (renderer) {
@@ -860,6 +865,8 @@ function currentWeapon() {
 
 function attemptShoot(now) {
   if (!canPlay()) return;
+  // 배틀로얄: 라운드가 진행 중일 때만 사격할 수 있다(대기/인터미션 중에는 워밍업).
+  if (state.round && state.round.state !== 'live') return;
   const weapon = currentWeapon();
   if (!weapon) return;
   if (now < state.nextShotAt || now < state.reloadEndAt) return;
@@ -892,8 +899,17 @@ function requestReload() {
 
 function requestSwap(weaponId) {
   if (!canPlay()) return;
+  // 무기 교체 = 진행 중이던 재장전 취소. 서버도 reloadEnd를 0으로 만들고 reloadCancel을 보낸다.
+  cancelLocalReload();
   net.send({ t: 'swap', w: weaponId });
   state.nextShotAt = performance.now() + 300;
+}
+
+/** 클라이언트 쪽 재장전 상태/타이머를 비운다(무기 교체·서버 취소 시). */
+function cancelLocalReload() {
+  state.reloadEndAt = 0;
+  state.me.reloadMs = 0;
+  dom.reloadHint.classList.add('hidden');
 }
 
 function requestHeal() {
@@ -910,12 +926,23 @@ function setupNet() {
     state.me.x = msg.x;
     state.me.z = msg.z;
   });
-  net.on('reloadStart', () => {
+  net.on('reloadStart', (msg) => {
+    if (msg && msg.weapon && msg.weapon !== state.me.weapon) return;
     audio.reload();
   });
+  net.on('reloadCancel', () => {
+    cancelLocalReload();
+  });
   net.on('reloaded', (msg) => {
+    // 무기가 바뀐 뒤 도착한 이전 무기의 완료 패킷은 버린다.
+    if (msg && msg.weapon && msg.weapon !== state.me.weapon) return;
     audio.reloaded();
     state.reloadEndAt = 0;
+    state.me.reloadMs = 0;
+    if (msg) {
+      if (Number.isFinite(msg.mag)) state.me.mag = msg.mag;
+      if (Number.isFinite(msg.reserve)) state.me.reserve = msg.reserve;
+    }
   });
   net.on('healed', (msg) => {
     audio.heal();
@@ -1030,6 +1057,7 @@ function onSnapshot(snap) {
       }
       if (wasAlive && !alive) {
         state.firing = false;
+        cancelLocalReload();
       }
     } else {
       let avatar = state.avatars.get(id);
@@ -1110,11 +1138,22 @@ function onEvents(msg) {
       case 'heal':
         if (ev.id !== state.myId) break;
         break;
+      case 'swap':
+        // 서버가 무기를 바꿔줬으면 이전 무기의 재장전 상태는 즉시 비운다.
+        if (ev.id === state.myId) cancelLocalReload();
+        break;
       case 'round': {
         if (ev.phase === 'end') {
-          audio.roundEnd(ev.winner === state.myName);
+          audio.roundEnd(ev.winnerId ? ev.winnerId === state.myId : false);
+          state.firing = false;
         } else if (ev.phase === 'start') {
           dom.result.classList.add('hidden');
+          dom.dead.classList.add('hidden');
+          state.firing = false;
+          cancelLocalReload();
+        } else if (ev.phase === 'waiting') {
+          dom.result.classList.add('hidden');
+          cancelLocalReload();
         }
         break;
       }
@@ -1192,12 +1231,28 @@ function updateHud() {
     el.classList.toggle('active', Number(el.dataset.weapon) === me.weapon);
   }
 
-  // 생존 / 라운드
+  // 생존 / 라운드 (배틀로얄: 킬 목표 없음, 생존자 수가 곧 규칙)
+  const roundState = state.round ? state.round.state : 'waiting';
   if (state.round) {
-    dom.aliveCount.textContent = Math.max(1, state.aliveCount);
-    const t = state.round.timeLeft;
-    dom.roundTime.textContent = `${Math.floor(t / 60)}:${String(t % 60).padStart(2, '0')}`;
-    dom.roundKills.textContent = `${me.kills} / ${state.config ? state.config.killTarget : 15} 킬`;
+    dom.aliveCount.textContent = state.aliveCount;
+    if (roundState === 'live') {
+      const t = state.round.timeLeft;
+      dom.roundTime.textContent = `${Math.floor(t / 60)}:${String(t % 60).padStart(2, '0')}`;
+      dom.roundKills.textContent = `${me.kills}킬 · ${state.round.index}라운드`;
+    } else if (roundState === 'ended') {
+      dom.roundTime.textContent = '라운드 종료';
+      dom.roundKills.textContent = `${me.kills}킬`;
+    } else {
+      dom.roundTime.textContent = '워밍업';
+      dom.roundKills.textContent = `${me.kills}킬`;
+    }
+  }
+
+  // 워밍업 배너: 혼자 있을 때는 라운드가 시작되지 않는다.
+  const waiting = roundState === 'waiting';
+  dom.waitBanner.classList.toggle('hidden', !(state.phase === 'playing' && waiting));
+  if (waiting && state.round) {
+    dom.waitCount.textContent = `${state.round.total} / ${state.round.need}`;
   }
 
   // 존
@@ -1210,10 +1265,14 @@ function updateHud() {
     dom.zoneBox.classList.toggle('shrinking', Boolean(state.zone.shrinking));
   }
 
-  // 사망 / 결과 오버레이
-  dom.dead.classList.toggle('hidden', !(state.phase === 'playing' && !me.alive));
-  if (!me.alive) {
-    dom.deadTimer.textContent = '4초 후 다시 생성됩니다.';
+  // 탈락(관전) 오버레이 — 배틀로얄은 라운드 중 리스폰이 없다.
+  const roundEnded = Boolean(state.round && state.round.state === 'ended');
+  const spectator = Boolean(state.phase === 'playing' && !me.alive && !roundEnded);
+  dom.dead.classList.toggle('hidden', !spectator);
+  if (spectator) {
+    dom.deadTitle.textContent = '탈락';
+    dom.deadTimer.textContent = '생존자 관전 중';
+    dom.deadHint.textContent = `남은 생존자 ${state.aliveCount}명 · 라운드가 끝날 때까지 리스폰되지 않습니다. 다음 라운드에서 다시 시작합니다.`;
   }
 
   const resultOpen = Boolean(state.round && state.round.state === 'ended' && state.phase === 'playing');
@@ -1227,14 +1286,15 @@ function updateHud() {
   dom.result.classList.toggle('hidden', !resultOpen);
   if (resultOpen) {
     if (state.round.winner) {
-      const mine = state.round.winner === state.myName;
+      const mine = state.round.winnerId === state.myId;
       dom.resultTitle.textContent = mine ? '승리!' : '라운드 종료';
-      dom.resultDetail.textContent = `${state.round.winner} 님이 ${state.round.winnerKills}킬로 승리했습니다.`;
+      const how = state.round.reason === 'timeout' ? '시간 종료 · HP 우세로' : '마지막 생존자로';
+      dom.resultDetail.textContent = `${state.round.winner} 님이 ${how} 승리했습니다. (${state.round.winnerKills}킬 · HP ${state.round.winnerHp})`;
     } else {
       dom.resultTitle.textContent = '무승부';
       dom.resultDetail.textContent = '이번 라운드는 승자가 없습니다.';
     }
-    dom.resultCountdown.textContent = `${state.round.nextIn}초 후 자동으로 다음 라운드가 시작됩니다. (${state.round.ready}/${state.round.total} 준비)`;
+    dom.resultCountdown.textContent = `${state.round.nextIn}초 후 자동으로 다음 라운드가 시작됩니다. 전원 부활·탄약·구역이 초기화됩니다. (${state.round.ready}/${state.round.total} 준비)`;
   }
 
   dom.ping.textContent = net.rtt ? `${net.rtt}ms` : '--ms';
@@ -1480,8 +1540,8 @@ function animate() {
       if (weapon && weapon.auto) attemptShoot(now);
     }
 
-    // 이동 패킷 (20Hz) — 서버가 위치를 확정하기 전에는 보내지 않는다.
-    if (!state.needSnap && now - lastMoveSend >= 50) {
+    // 이동 패킷 (20Hz) — 서버가 위치를 확정하기 전, 그리고 살아 있을 때만 보낸다.
+    if (state.me.alive && !state.needSnap && now - lastMoveSend >= 50) {
       lastMoveSend = now;
       net.send({ t: 'm', x: state.me.x, z: state.me.z, yaw: state.me.yaw, pitch: state.me.pitch });
     }
@@ -1533,6 +1593,7 @@ async function boot() {
     } catch (err) {
       console.error('[3dfp] 월드 구성 실패', err);
       showMenuError('맵을 불러오지 못했습니다. 새로 고침해 주세요.');
+      window.showBootError?.('맵 데이터를 불러오지 못했습니다. 서버 상태를 확인하고 새로 고침해 주세요.');
     }
   }
 
@@ -1542,6 +1603,9 @@ async function boot() {
       state.firing = false;
     }
   });
+
+  // 부트스트랩이 끝났음은 index.html의 대기 감시(importmap/모듈 로드 실패 배너)에 알린다.
+  window.__3dfpBooted = true;
 }
 
 boot();

@@ -9,6 +9,7 @@
  */
 
 const { Game } = require('./game');
+const { MAX_ROOMS } = require('./limits');
 
 const MAX_PLAYERS_PER_ROOM = 8;
 const DEFAULT_ROOM_CODE = 'LOBBY0';
@@ -19,6 +20,7 @@ const EMPTY_ROOM_TTL_MS = 60000;
 const ERROR = Object.freeze({
   ROOM_NOT_FOUND: { code: 'ROOM_NOT_FOUND', message: '방을 찾을 수 없음' },
   ROOM_FULL: { code: 'ROOM_FULL', message: '정원 초과' },
+  TOO_MANY_ROOMS: { code: 'TOO_MANY_ROOMS', message: '방이 너무 많습니다. 잠시 후 다시 시도해 주세요.' },
   BAD_REQUEST: { code: 'BAD_REQUEST', message: '잘못된 요청' },
   ALREADY_IN_ROOM: { code: 'ALREADY_IN_ROOM', message: '이미 방에 참여 중' },
 });
@@ -42,11 +44,17 @@ class Room {
 }
 
 class RoomManager {
-  constructor() {
+  constructor({ maxRooms = MAX_ROOMS } = {}) {
+    /** 동시에 존재할 수 있는 방 수(기본 공개방 포함) */
+    this.maxRooms = maxRooms;
     /** @type {Map<string, Room>} */
     this.rooms = new Map();
     this.defaultRoom = new Room(DEFAULT_ROOM_CODE, true);
     this.rooms.set(DEFAULT_ROOM_CODE, this.defaultRoom);
+  }
+
+  get isFull() {
+    return this.rooms.size >= this.maxRooms;
   }
 
   normalizeCode(raw) {
@@ -69,7 +77,9 @@ class RoomManager {
     return `R${Date.now().toString(36).toUpperCase().slice(-5)}`.slice(0, CODE_LENGTH);
   }
 
+  /** 방 생성. 한도에 도달했으면 null. */
   createRoom() {
+    if (this.isFull) return null;
     const code = this.generateCode();
     const room = new Room(code, false);
     this.rooms.set(code, room);
@@ -99,6 +109,7 @@ class RoomManager {
 
     if (wantsCreate) {
       room = this.createRoom();
+      if (!room) return { error: ERROR.TOO_MANY_ROOMS };
     } else {
       const rawCode = request && (request.code ?? request.roomCode);
       const code = this.normalizeCode(rawCode);
@@ -143,6 +154,7 @@ module.exports = {
   Room,
   ERROR,
   MAX_PLAYERS_PER_ROOM,
+  MAX_ROOMS,
   DEFAULT_ROOM_CODE,
   CODE_LENGTH,
 };

@@ -13,7 +13,17 @@ const path = require('path');
 
 const root = path.join(__dirname, '..');
 
-const serverFiles = ['server/index.js', 'server/game.js', 'server/rooms.js', 'server/map.js', 'test/unit.js', 'test/smoke.js'];
+const serverFiles = [
+  'server/index.js',
+  'server/game.js',
+  'server/rooms.js',
+  'server/map.js',
+  'server/limits.js',
+  'scripts/vendor-three.js',
+  'test/unit.js',
+  'test/smoke.js',
+  'test/soak.js',
+];
 const clientFiles = ['public/js/main.js', 'public/js/net.js', 'public/js/audio.js'];
 
 let failed = 0;

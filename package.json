@@ -1,20 +1,24 @@
 {
   "name": "3dfp",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
-  "description": "3D 1인칭 멀티플레이어 브라우저 FPS — 초기 클라이언트/서버 골격",
+  "description": "3D 1인칭 멀티플레이어 브라우저 FPS — 배틀로얄(노리스폰) 골격",
   "main": "server/index.js",
   "scripts": {
     "start": "node server/index.js",
     "dev": "node server/index.js",
     "check": "node scripts/check.js",
-    "test": "node test/unit.js && node test/smoke.js"
+    "test": "node test/unit.js && node test/smoke.js",
+    "test:soak": "node test/soak.js",
+    "test:all": "npm run check && npm test && npm run test:soak",
+    "vendor:three": "node scripts/vendor-three.js"
   },
   "keywords": [
     "fps",
     "three.js",
     "websocket",
-    "multiplayer"
+    "multiplayer",
+    "battle-royale"
   ],
   "license": "MIT",
   "engines": {
@@ -22,5 +26,8 @@
   },
   "dependencies": {
     "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "three": "0.170.0"
   }
 }

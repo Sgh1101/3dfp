@@ -17,6 +17,14 @@ const { WebSocketServer } = require('ws');
 const { RoomManager, ERROR, MAX_PLAYERS_PER_ROOM, DEFAULT_ROOM_CODE } = require('./rooms');
 const { mapPayload } = require('./map');
 const { TICK_MS, sanitizeName, publicConfig } = require('./game');
+const {
+  RateLimiter,
+  BackpressureGuard,
+  MAX_TOTAL_CONNECTIONS,
+  MAX_BUFFERED_BYTES,
+  JOIN_RATE,
+  PING_RATE,
+} = require('./limits');
 
 const PORT = Number(process.env.PORT) || 3000;
 const HOST = process.env.HOST || '0.0.0.0';
@@ -101,7 +109,6 @@ function serveStatic(req, res) {
 }
 
 const server = http.createServer((req, res) => {
-  const url = req.url || '/';
   if (req.method === 'OPTIONS') {
     res.writeHead(204, { Allow: 'GET, HEAD, OPTIONS' });
     res.end();
@@ -113,34 +120,54 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  if (url.startsWith('/api/map')) {
-    sendJSON(res, 200, MAP_PAYLOAD);
+  // ── API 경로는 정확 일치(===)로만 매칭한다. ──
+  // 접두사(startsWith) 매칭은 `/api/map-evil` 같은 경로가 통과하는 구멍이 된다.
+  let url;
+  try {
+    url = new URL(req.url || '/', 'http://localhost');
+  } catch {
+    sendJSON(res, 400, { error: 'BAD_REQUEST', code: 'BAD_REQUEST', message: '잘못된 요청' });
     return;
   }
-  if (url.startsWith('/api/health')) {
-    let players = 0;
-    let activeRooms = 0;
-    for (const room of rooms.rooms.values()) {
-      if (room.playerCount > 0) {
-        activeRooms += 1;
-        players += room.playerCount;
-      }
+  const pathname = url.pathname;
+
+  if (pathname.startsWith('/api/')) {
+    if (pathname === '/api/map') {
+      sendJSON(res, 200, MAP_PAYLOAD);
+      return;
     }
-    sendJSON(res, 200, {
-      ok: true,
-      uptime: Math.round(process.uptime()),
-      rooms: rooms.rooms.size,
-      activeRooms,
-      players,
-      defaultRoom: DEFAULT_ROOM_CODE,
-      maxPlayersPerRoom: MAX_PLAYERS_PER_ROOM,
-    });
+    if (pathname === '/api/config') {
+      sendJSON(res, 200, CONFIG_PAYLOAD);
+      return;
+    }
+    if (pathname === '/api/health') {
+      let players = 0;
+      let activeRooms = 0;
+      for (const room of rooms.rooms.values()) {
+        if (room.playerCount > 0) {
+          activeRooms += 1;
+          players += room.playerCount;
+        }
+      }
+      sendJSON(res, 200, {
+        ok: true,
+        uptime: Math.round(process.uptime()),
+        rooms: rooms.rooms.size,
+        activeRooms,
+        players,
+        connections: clients.size,
+        defaultRoom: DEFAULT_ROOM_CODE,
+        maxPlayersPerRoom: MAX_PLAYERS_PER_ROOM,
+        maxRooms: rooms.maxRooms,
+        maxConnections: MAX_TOTAL_CONNECTIONS,
+        maxBufferedBytes: MAX_BUFFERED_BYTES,
+      });
+      return;
+    }
+    sendJSON(res, 404, { error: 'NOT_FOUND', code: 'NOT_FOUND', message: '알 수 없는 API 경로' });
     return;
   }
-  if (url.startsWith('/api/config')) {
-    sendJSON(res, 200, CONFIG_PAYLOAD);
-    return;
-  }
+
   serveStatic(req, res);
 });
 
@@ -162,7 +189,29 @@ function send(ws, message) {
 function broadcast(room, message) {
   const data = typeof message === 'string' ? message : JSON.stringify(message);
   for (const client of clients.values()) {
-    if (client.room === room) send(client.ws, data);
+    if (client.room !== room) continue;
+    // 느린 소켓 보호: 버퍼가 차 있으면 이번 스냅샷은 건너뛰고, 계속 막혀 있으면 끊는다.
+    const verdict = client.backpressure.check(client.ws);
+    if (verdict === 'skip') continue;
+    if (verdict === 'drop') {
+      dropSlowClient(client);
+      continue;
+    }
+    send(client.ws, data);
+  }
+}
+
+/** 수신을 따라오지 못하는 소켓을 정리한다(서버 메모리/큐 보호). */
+function dropSlowClient(client) {
+  send(client.ws, {
+    t: 'error',
+    code: 'SLOW_CLIENT',
+    message: '네트워크가 느려 연결을 종료합니다. 다시 접속해 주세요.',
+  });
+  try {
+    client.ws.close(4014, 'slow client');
+  } catch {
+    // 무시
   }
 }
 
@@ -175,8 +224,28 @@ function leaveRoom(client, reason) {
 }
 
 wss.on('connection', (ws) => {
+  // 전역 동시 연결 상한(SERVER_FULL)
+  if (clients.size >= MAX_TOTAL_CONNECTIONS) {
+    send(ws, { t: 'error', code: 'SERVER_FULL', message: '서버 접속 인원이 가득 찼습니다. 잠시 후 다시 시도해 주세요.' });
+    try {
+      ws.close(4013, 'server full');
+    } catch {
+      // 무시
+    }
+    return;
+  }
+
   const id = crypto.randomBytes(4).toString('hex');
-  const client = { id, ws, room: null, name: '플레이어', joined: false, joinAttempts: 0 };
+  const client = {
+    id,
+    ws,
+    room: null,
+    name: '플레이어',
+    joined: false,
+    joinLimiter: new RateLimiter(JOIN_RATE.max, JOIN_RATE.windowMs),
+    pingLimiter: new RateLimiter(PING_RATE.max, PING_RATE.windowMs),
+    backpressure: new BackpressureGuard(),
+  };
   clients.set(id, client);
 
   let closed = false;
@@ -203,8 +272,8 @@ wss.on('connection', (ws) => {
     if (!msg || typeof msg !== 'object' || typeof msg.t !== 'string') return;
 
     if (msg.t === 'join') {
-      client.joinAttempts += 1;
-      if (client.joinAttempts > 12) {
+      // 참여 요청 레이트리밋(기본 10초에 5회)
+      if (!client.joinLimiter.allow(Date.now())) {
         send(ws, { t: 'error', code: 'RATE_LIMIT', message: '참여 요청이 너무 많습니다. 잠시 후 다시 시도해 주세요.' });
         return;
       }
@@ -260,6 +329,8 @@ wss.on('connection', (ws) => {
         game.handleReady(client.id);
         break;
       case 'ping':
+        // 핑 레이트리밋(기본 1초에 5회): 초과분은 응답하지 않는다(증폭 방지).
+        if (!client.pingLimiter.allow(Date.now())) break;
         send(ws, { t: 'pong', c: msg.c ?? 0, now: Date.now() });
         break;
       case 'leave':
@@ -327,6 +398,10 @@ server.listen(PORT, HOST, () => {
   console.log(`[3dfp] 서버 실행 중 → http://${shown}:${PORT}`);
   // eslint-disable-next-line no-console
   console.log(`[3dfp] 기본 방 코드: ${DEFAULT_ROOM_CODE} · 방 정원: ${MAX_PLAYERS_PER_ROOM}명 · 틱: ${TICK_MS}ms`);
+  // eslint-disable-next-line no-console
+  console.log(
+    `[3dfp] 한도: 연결 ${MAX_TOTAL_CONNECTIONS} · 방 ${rooms.maxRooms} · 참여 ${JOIN_RATE.max}/${Math.round(JOIN_RATE.windowMs / 1000)}s · 핑 ${PING_RATE.max}/${Math.round(PING_RATE.windowMs / 1000)}s · 버퍼 ${Math.round(MAX_BUFFERED_BYTES / 1024)}KB`,
+  );
 });
 
 function shutdown(signal) {

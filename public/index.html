@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
     <meta name="theme-color" content="#0b0f14" />
     <meta name="description" content="3DFP — 3D 1인칭 멀티플레이어 브라우저 FPS" />
-    <title>3DFP — 3D 1인칭 멀티플레이어 FPS</title>
+    <title>3DFP — 3D 1인칭 멀티플레이어 배틀로얄 FPS</title>
 
     <link rel="stylesheet" href="css/style.css" />
     <link
@@ -13,19 +13,53 @@
       href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%23111820'/%3E%3Cpath d='M12 22h30a10 10 0 0 1 0 20H28l-6 8h-8l6-8h-8z' fill='%2334d399'/%3E%3C/svg%3E"
     />
 
-    <!-- Three.js는 importmap으로 깔끔하게 불러온다 (CDN) -->
+    <!-- Three.js는 저장소에 함께 넣은 로컬 번들을 쓴다(CDN 불필요 → 오프라인·차단 환경에서도 동작).
+         번들 갱신: `npm install && npm run vendor:three` -->
     <script type="importmap">
       {
         "imports": {
-          "three": "https://unpkg.com/three@0.170.0/build/three.module.js",
-          "three/addons/": "https://unpkg.com/three@0.170.0/examples/jsm/"
+          "three": "/vendor/three/three.module.min.js"
         }
       }
+    </script>
+
+    <script>
+      // 모듈(three + main.js) 로드가 실패해도 화면이 까맣게 멈추지 않도록 안내 배너를 띄운다.
+      window.__3dfpBooted = false;
+      window.showBootError = function (message) {
+        var box = document.getElementById('boot-error');
+        var text = document.getElementById('boot-error-text');
+        if (!box || !text) return;
+        text.textContent = message;
+        box.classList.remove('hidden');
+      };
+      window.addEventListener(
+        'error',
+        function (event) {
+          if (window.__3dfpBooted) return;
+          var tag = event && event.target && event.target.tagName;
+          if (tag === 'SCRIPT' || tag === 'LINK') {
+            window.showBootError('게임 모듈을 불러오지 못했습니다. 네트워크를 확인한 뒤 새로 고침해 주세요.');
+          }
+        },
+        true,
+      );
+      window.setTimeout(function () {
+        if (!window.__3dfpBooted) {
+          window.showBootError('3D 모듈을 불러오는 중입니다… 문제가 계속되면 새로 고침해 주세요.');
+        }
+      }, 8000);
     </script>
   </head>
 
   <body>
     <canvas id="game" aria-label="3D 게임 화면"></canvas>
+
+    <!-- 모듈 로드 실패/지연 안내 (CDN 없이 로컬 번들만 쓰지만, 파일이 없거나 막힌 경우 대비) -->
+    <div id="boot-error" class="boot-error hidden" role="alert">
+      <b>게임을 시작하지 못했습니다.</b>
+      <span id="boot-error-text">잠시 후 다시 시도해 주세요.</span>
+    </div>
 
     <!-- ── HUD ─────────────────────────────────────────────── -->
     <div id="hud" class="hud hidden" aria-live="polite">
@@ -37,7 +71,7 @@
 
         <div class="round-box">
           <div class="round-time" id="round-time">3:00</div>
-          <div class="round-kills" id="round-kills">0 / 15 킬</div>
+          <div class="round-kills" id="round-kills">0킬</div>
         </div>
 
         <div class="alive-box">
@@ -47,6 +81,10 @@
       </div>
 
       <div class="killfeed" id="killfeed"></div>
+
+      <div class="wait-banner hidden" id="wait-banner">
+        <b>워밍업</b> — 상대를 기다리는 중입니다 (<span id="wait-count">1 / 2</span>) · 2명이 모이면 배틀로얄이 시작됩니다.
+      </div>
 
       <div class="crosshair" id="crosshair">
         <span class="ch ch-t"></span>
@@ -93,7 +131,7 @@
       <div class="panel">
         <header class="panel-head">
           <h1>3D<span>FP</span></h1>
-          <p class="subtitle">3D 1인칭 멀티플레이어 브라우저 FPS · 초기 골격 v0.1</p>
+          <p class="subtitle">3D 1인칭 멀티플레이어 브라우저 FPS · 배틀로얄(노리스폰) v0.2</p>
         </header>
 
         <div class="field">
@@ -128,7 +166,10 @@
             <li><b>ESC</b> 마우스 고정 해제</li>
           </ul>
           <p class="guide-note">모바일: 왼쪽 조이스틱 이동 · 오른쪽 화면 드래그로 조준 · 버튼으로 사격/재장전/무기/힐</p>
-          <p class="guide-note">존 바깥에 있으면 피해를 입습니다. 15킬을 먼저 달성하거나 라운드 종료 시 킬이 가장 많은 사람이 승리합니다.</p>
+          <p class="guide-note">
+            <b>배틀로얄</b> — 라운드 중 사망하면 라운드가 끝날 때까지 관전하고, 마지막 한 명이 승리합니다. 혼자면 워밍업(상대 대기)이고, 2명이
+            모이면 시작합니다. 존 바깥에 있으면 피해를 입습니다.
+          </p>
         </section>
 
         <div class="loading hidden" id="menu-loading"><span class="spinner"></span><span id="menu-loading-text">연결 중…</span></div>
@@ -154,12 +195,12 @@
       </div>
     </div>
 
-    <!-- ── 사망 ───────────────────────────────────────────── -->
+    <!-- ── 탈락(관전) ─────────────────────────────────────── -->
     <div id="dead" class="overlay hidden">
       <div class="panel panel-small">
-        <h2>사망</h2>
-        <p id="dead-timer">4초 후 다시 생성됩니다.</p>
-        <p class="hint">다시 생성되면 10초간 스폰 보호가 적용됩니다. (사격하면 해제)</p>
+        <h2 id="dead-title">탈락</h2>
+        <p id="dead-timer">생존자 관전 중</p>
+        <p class="hint" id="dead-hint">라운드가 끝날 때까지 리스폰되지 않습니다. 다음 라운드에서 다시 시작합니다.</p>
       </div>
     </div>
 
@@ -172,6 +213,6 @@
       </div>
     </div>
 
-    <script type="module" src="js/main.js"></script>
+    <script type="module" src="js/main.js" onerror="window.showBootError && window.showBootError('게임 스크립트를 불러오지 못했습니다. 새로 고침해 주세요.')"></script>
   </body>
 </html>
