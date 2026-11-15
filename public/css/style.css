@@ -217,6 +217,24 @@ body {
   color: var(--accent);
 }
 
+/* 구역 밖 경고 — 안전 구역을 벗어나 피해를 받는 중 */
+.zone-warning {
+  position: absolute;
+  top: calc(124px + var(--safe-t));
+  left: 50%;
+  transform: translateX(-50%);
+  max-width: min(560px, 88vw);
+  padding: 6px 14px;
+  border-radius: 999px;
+  border: 1px solid rgba(248, 113, 113, 0.55);
+  background: rgba(70, 10, 10, 0.88);
+  color: #fecaca;
+  font-size: calc(var(--unit) * 0.85);
+  font-weight: 700;
+  text-align: center;
+  animation: pulse 1.2s infinite;
+}
+
 .kf-item {
   background: rgba(8, 12, 18, 0.8);
   border-left: 3px solid var(--accent);
@@ -696,6 +714,10 @@ input[type="text"]:focus {
   font-size: calc(var(--unit) * 1.6);
 }
 
+#btn-resume {
+  margin: 2px 0 12px;
+}
+
 .panel-small p {
   margin: 6px 0 14px;
   color: #c3d6d2;
@@ -790,6 +812,14 @@ input[type="text"]:focus {
   color: #1a0505;
 }
 
+/* 힐은 마지막 줄을 가득 채워 버튼 격자가 비지 않게 한다. */
+#btn-heal {
+  grid-column: span 2;
+  width: 100%;
+  height: 62px;
+  border-radius: 20px;
+}
+
 /* ── 애니메이션 ──────────────────────────────────────────── */
 @keyframes spin {
   to {
@@ -853,6 +883,12 @@ input[type="text"]:focus {
     padding: 5px 10px;
   }
 
+  .zone-warning {
+    top: calc(148px + var(--safe-t));
+    font-size: calc(var(--unit) * 0.78);
+    padding: 5px 10px;
+  }
+
   .round-kills,
   .weapon-slots,
   .ping {
@@ -879,6 +915,25 @@ input[type="text"]:focus {
   }
   .subtitle {
     margin-bottom: 10px;
+  }
+  /* 가로 모드에서는 조작부가 HUD 를 가리지 않도록 살짝 줄인다. */
+  .joystick {
+    width: 104px;
+    height: 104px;
+    bottom: calc(64px + var(--safe-b));
+  }
+  .touch-buttons {
+    bottom: calc(56px + var(--safe-b));
+  }
+  .touch-btn {
+    width: 62px;
+    height: 62px;
+  }
+  .btn-fire {
+    height: 66px;
+  }
+  #btn-heal {
+    height: 50px;
   }
 }
 

@@ -12,6 +12,7 @@ const { spawn } = require('child_process');
 const path = require('path');
 const assert = require('assert');
 const WebSocket = require('ws');
+const { ERROR } = require('../server/rooms');
 
 const PORT = Number(process.env.TEST_PORT) || 3900 + Math.floor(Math.random() * 90);
 const BASE = `http://127.0.0.1:${PORT}`;
@@ -323,12 +324,13 @@ async function main() {
       assert.ok(pongs.length <= 5, `pong ${pongs.length}개 — 레이트리밋이 동작하지 않았다`);
     });
 
-    await step('존재하지 않는 방 코드 → "방을 찾을 수 없음"', async () => {
+    await step('존재하지 않는 방 코드 → "방을 찾을 수 없습니다"(코드 확인 안내)', async () => {
       const client = await openClient('C');
       const res = await join(client, { name: '감마', code: 'ZZZZZZ' });
       assert.strictEqual(res.t, 'error');
       assert.strictEqual(res.code, 'ROOM_NOT_FOUND');
-      assert.strictEqual(res.message, '방을 찾을 수 없음');
+      assert.strictEqual(res.message, ERROR.ROOM_NOT_FOUND.message);
+      assert.ok(res.message.includes('코드'), '사용자가 코드를 확인할 수 있게 안내해야 한다');
     });
 
     await step('방 만들기 → 6자리 새 코드', async () => {
@@ -341,7 +343,7 @@ async function main() {
       client.roomCode = res.code;
     });
 
-    await step('8명 정원 초과 → "정원 초과"', async () => {
+    await step('8명 정원 초과 → "방 정원이 가득 찼습니다"', async () => {
       const host = clients.find((c) => c.roomCode);
       const code = host.roomCode;
       // host 포함 8명까지 채운다.
@@ -354,7 +356,8 @@ async function main() {
       const res = await join(extra, { name: '초과', code });
       assert.strictEqual(res.t, 'error');
       assert.strictEqual(res.code, 'ROOM_FULL');
-      assert.strictEqual(res.message, '정원 초과');
+      assert.strictEqual(res.message, ERROR.ROOM_FULL.message);
+      assert.ok(res.message.includes('8'), '정원이 8명임을 알려야 한다');
     });
 
     await step('이동 패킷이 스냅샷에 반영된다', async () => {

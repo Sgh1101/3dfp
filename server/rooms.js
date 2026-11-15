@@ -18,8 +18,8 @@ const CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // 헷갈리는 I, O, 
 const EMPTY_ROOM_TTL_MS = 60000;
 
 const ERROR = Object.freeze({
-  ROOM_NOT_FOUND: { code: 'ROOM_NOT_FOUND', message: '방을 찾을 수 없음' },
-  ROOM_FULL: { code: 'ROOM_FULL', message: '정원 초과' },
+  ROOM_NOT_FOUND: { code: 'ROOM_NOT_FOUND', message: '방을 찾을 수 없습니다. 방 코드를 확인해 주세요.' },
+  ROOM_FULL: { code: 'ROOM_FULL', message: '방 정원(8명)이 가득 찼습니다. 다른 코드로 참여하거나 새 방을 만들어 주세요.' },
   TOO_MANY_ROOMS: { code: 'TOO_MANY_ROOMS', message: '방이 너무 많습니다. 잠시 후 다시 시도해 주세요.' },
   BAD_REQUEST: { code: 'BAD_REQUEST', message: '잘못된 요청' },
   ALREADY_IN_ROOM: { code: 'ALREADY_IN_ROOM', message: '이미 방에 참여 중' },

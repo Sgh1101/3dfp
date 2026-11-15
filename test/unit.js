@@ -98,6 +98,33 @@ test('아레나 크기는 160m', () => {
   assert.strictEqual(ARENA.size, 160);
 });
 
+test('스폰 지점이 커버에서 충분히 떨어져 있다(벽 코앞 스폰 방지)', () => {
+  for (const spawn of SPAWNS) {
+    let nearest = Infinity;
+    for (const cover of COVERS) {
+      const cx = Math.max(cover.minX, Math.min(spawn.x, cover.maxX));
+      const cz = Math.max(cover.minZ, Math.min(spawn.z, cover.maxZ));
+      nearest = Math.min(nearest, Math.hypot(spawn.x - cx, spawn.z - cz));
+    }
+    assert.ok(nearest >= 6, `스폰 (${spawn.x.toFixed(1)}, ${spawn.z.toFixed(1)})가 커버에서 ${nearest.toFixed(2)}m 밖에 없다`);
+  }
+});
+
+test('스폰끼리 25m 이상 떨어져 있고 아레나 중심을 바라본다', () => {
+  for (let i = 0; i < SPAWNS.length; i += 1) {
+    for (let j = i + 1; j < SPAWNS.length; j += 1) {
+      const d = Math.hypot(SPAWNS[i].x - SPAWNS[j].x, SPAWNS[i].z - SPAWNS[j].z);
+      assert.ok(d >= 25, `스폰 ${i}·${j} 거리가 ${d.toFixed(1)}m 뿐이다`);
+    }
+    const spawn = SPAWNS[i];
+    const len = Math.hypot(spawn.x, spawn.z);
+    const fx = -Math.sin(spawn.yaw);
+    const fz = -Math.cos(spawn.yaw);
+    const dot = (fx * -spawn.x + fz * -spawn.z) / len;
+    assert.ok(dot > 0.99, `스폰 ${i}가 중심을 바라보지 않는다(dot ${dot.toFixed(3)})`);
+  }
+});
+
 test('rayAABB가 박스를 맞춘다', () => {
   const t = rayAABB(0, 1, -10, 0, 0, 1, -1, 0, -1, 1, 2, 1, 100);
   assert.ok(t !== null && Math.abs(t - 9) < 1e-6, `기대 9, 실제 ${t}`);

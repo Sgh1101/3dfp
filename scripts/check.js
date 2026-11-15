@@ -23,6 +23,8 @@ const serverFiles = [
   'test/unit.js',
   'test/smoke.js',
   'test/soak.js',
+  'test/ui-static.js',
+  'test/browser.js',
 ];
 const clientFiles = ['public/js/main.js', 'public/js/net.js', 'public/js/audio.js'];
 

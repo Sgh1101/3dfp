@@ -9,8 +9,12 @@
  *  - 2단계: 1라운드 종료 → (전원 준비로) 즉시 2라운드 시작 = 전원 부활
  *  - 3단계: 2라운드에서 봇들이 실제로 사격·탈락 → 마지막 생존자 승리 → 3라운드 재시작
  *
+ * 봇은 100m 안의 가장 가까운 적을 추격해 교전하고, 장애물에 막히면 같은 쪽으로 돌아갑니다
+ * (나무 없이 서로 엉키던 문제를 잡아 라운드가 1분 안에 결정됩니다).
+ * 근거리에서는 절반은 자리를 잡고, 절반은 횡이동해 동시 사망(무승부)을 피합니다.
+ *
  * 검증: 노리스폰, 마지막 생존자 승리, 부활/탄약/구역 초기화, 킥·오류 없음, 서버 생존.
- * 실행: node test/soak.js   (SOAK_BOTS·SOAK_TIMEOUT_MS 로 조정)
+ * 실행: node test/soak.js   (SOAK_BOTS·SOAK_TIMEOUT_MS·SOAK_DEBUG 로 조정)
  */
 
 const { spawn } = require('child_process');
@@ -81,6 +85,20 @@ function hasLineOfSight(covers, from, to) {
 }
 
 // ── 봇 ──────────────────────────────────────────────────────
+/** 다음 위치가 커버와 부딪히면 그 커버를 돌려준다(봇 길찾기용). */
+function blockingCover(covers, x, z, radius = 0.7) {
+  for (const cover of covers) {
+    const minX = cover.x - cover.w / 2;
+    const maxX = cover.x + cover.w / 2;
+    const minZ = cover.z - cover.d / 2;
+    const maxZ = cover.z + cover.d / 2;
+    const cx = Math.max(minX, Math.min(x, maxX));
+    const cz = Math.max(minZ, Math.min(z, maxZ));
+    if (Math.hypot(x - cx, z - cz) < radius) return cover;
+  }
+  return null;
+}
+
 class Bot {
   constructor(index) {
     this.index = index;
@@ -210,6 +228,12 @@ class Bot {
     const enemy = this.nearestEnemy();
     if (!enemy) return;
 
+    if (process.env.SOAK_DEBUG && now - (this.lastDebugAt || 0) > 2000) {
+      this.lastDebugAt = now;
+      // eslint-disable-next-line no-console
+      console.log(`[soak:debug] ${this.name} pos=(${this.pos.x.toFixed(1)},${this.pos.z.toFixed(1)}) enemy=${enemy.dist.toFixed(1)}m mag=${me[10]} state=${this.snap.round.state}`);
+    }
+
     // 진행 정체 감지 → 잠깐 옆으로 비켜서 장애물을 돈다.
     if (Math.hypot(this.pos.x - this.lastPos.x, this.pos.z - this.lastPos.z) > 0.12) {
       this.lastProgressAt = now;
@@ -222,30 +246,76 @@ class Bot {
 
     const yaw = Math.atan2(-enemy.x + this.pos.x, -enemy.z + this.pos.z);
 
-    // 교전 지점: 아레나 중앙 주변에 봇마다 다른 자리를 잡는다(서로 시야가 열리는 거리).
+    // 교전 규칙(결정적): 100m 안에 적이 있으면 곧장 추격한다.
+    // 더 멀면(라운드 직후) 아레나 중앙 교전 지점으로 모인다.
     const rallyAngle = (Math.PI * 2 * this.index) / 4 + Math.PI / 4;
     const rally = { x: Math.cos(rallyAngle) * 9, z: Math.sin(rallyAngle) * 9 };
-    const distToRally = Math.hypot(this.pos.x - rally.x, this.pos.z - rally.z);
-    const chasing = enemy.dist < 22 || distToRally < 2.5;
-    const target = chasing ? { x: enemy.x, z: enemy.z } : rally;
+    const target = enemy.dist < 100 ? { x: enemy.x, z: enemy.z } : rally;
 
     const dx = target.x - this.pos.x;
     const dz = target.z - this.pos.z;
     const dist = Math.hypot(dx, dz) || 1;
 
-    if (now - this.lastMoveSentAt >= TICK_MS) {
+    // 17m 안에서는 반반씩 다른 전술을 쓴다(한쪽은 자리 잡고 정조준, 한쪽은 횡이동).
+    // 두 봇이 동시에 죽는 무승부(wipe)를 피하려는 의도적인 비대칭이다.
+    const closeRange = enemy.dist < 17;
+    const holdPosition = closeRange && this.index % 2 === 0;
+    const strafe = closeRange && this.index % 2 === 1;
+
+    if (now - this.lastMoveSentAt >= TICK_MS && !holdPosition) {
       this.lastMoveSentAt = now;
       let ux = dx / dist;
       let uz = dz / dist;
-      if (this.detourUntil > now) {
+      if (strafe) {
+        const tmp = ux;
+        ux = -uz * this.detourSign;
+        uz = tmp * this.detourSign;
+      } else if (this.detourUntil > now) {
         const tmp = ux;
         ux = -uz * this.detourSign;
         uz = tmp * this.detourSign;
       }
-      const speed = enemy.dist < 3 ? -2.5 : 6.2; // 너무 붙으면 살짝 물러난다
+      const speed = strafe ? 3.4 : enemy.dist < 3 ? -2.5 : 6.2; // 너무 붙으면 살짝 물러난다
       const stepLen = (speed * TICK_MS) / 1000;
+      // 장애물에 막히면 같은 방향(왼/오른쪽)으로 계속 돌아간다.
+      // 방향을 매번 새로 골라 버리면 모서리에서 앞뒤로 진동하며 진행하지 못한다.
+      let nx = this.pos.x + ux * stepLen;
+      let nz = this.pos.z + uz * stepLen;
+      if (blockingCover(this.map.covers, nx, nz)) {
+        if (!this.wallSide) this.wallSide = Math.random() < 0.5 ? 1 : -1;
+        const turns = [
+          (this.wallSide * Math.PI) / 4,
+          (this.wallSide * Math.PI) / 2,
+          (this.wallSide * 3 * Math.PI) / 4,
+          (-this.wallSide * Math.PI) / 4,
+          (-this.wallSide * Math.PI) / 2,
+          (-this.wallSide * 3 * Math.PI) / 4,
+        ];
+        let found = false;
+        for (const turn of turns) {
+          const cos = Math.cos(turn);
+          const sin = Math.sin(turn);
+          const rx = ux * cos - uz * sin;
+          const rz = ux * sin + uz * cos;
+          const tx = this.pos.x + rx * stepLen;
+          const tz = this.pos.z + rz * stepLen;
+          if (!blockingCover(this.map.covers, tx, tz)) {
+            nx = tx;
+            nz = tz;
+            found = true;
+            break;
+          }
+        }
+        this.wallUntil = now + 900; // 이 방향을 잠시 유지
+        if (!found) {
+          nx = this.pos.x;
+          nz = this.pos.z;
+        }
+      } else if (now > (this.wallUntil || 0)) {
+        this.wallSide = 0; // 막힘이 풀렸으면 다시 직선으로
+      }
       this.moves += 1;
-      this.send({ t: 'm', x: this.pos.x + ux * stepLen, z: this.pos.z + uz * stepLen, yaw, pitch: 0 });
+      this.send({ t: 'm', x: nx, z: nz, yaw, pitch: 0 });
     }
 
     const mag = me[10];

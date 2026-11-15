@@ -83,13 +83,19 @@ const COVERS = expandDefs(COVER_DEFS).map((def, index) => {
   };
 });
 
-/** 8개 스폰 지점: 반지름 62m 링, 45도 간격. */
+/**
+ * 8개 스폰 지점: 반지름 60m 링에 45도 간격.
+ * 링 각도에 오프셋을 두어 스폰이 커버(벽·컨테이너) 코앞에 붙지 않도록 한다.
+ * (오프셋 0일 때는 모든 스폰이 2.2m 벽에서 0.2m 거리라 시야가 벽으로 막혔다.)
+ */
+const SPAWN_RADIUS = 60;
+const SPAWN_ANGLE_OFFSET = Math.PI / 8 + (22 * Math.PI) / 180;
 const SPAWNS = [];
 for (let i = 0; i < 8; i += 1) {
-  const angle = (Math.PI * 2 * i) / 8 + Math.PI / 8;
+  const angle = (Math.PI * 2 * i) / 8 + SPAWN_ANGLE_OFFSET;
   SPAWNS.push({
-    x: Math.cos(angle) * 62,
-    z: Math.sin(angle) * 62,
+    x: Math.cos(angle) * SPAWN_RADIUS,
+    z: Math.sin(angle) * SPAWN_RADIUS,
     // 아레나 중심(0,0)을 바라보는 yaw. 전방 벡터는 (-sin(yaw), -cos(yaw)).
     yaw: Math.atan2(Math.cos(angle), Math.sin(angle)),
   });
@@ -127,7 +133,7 @@ function clearSpawn(spawn, radius) {
 }
 
 for (let i = 0; i < SPAWNS.length; i += 1) {
-  SPAWNS[i] = clearSpawn(SPAWNS[i], 1.2);
+  SPAWNS[i] = clearSpawn(SPAWNS[i], 2.5);
 }
 
 /** 클라이언트로 보낼 맵 페이로드(중심 좌표 + 크기). */

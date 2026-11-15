@@ -26,6 +26,11 @@ const dom = {
   btnQuick: document.getElementById('btn-quick'),
   btnCreate: document.getElementById('btn-create'),
   pause: document.getElementById('pause'),
+  pauseTitle: document.getElementById('pause-title'),
+  pauseText: document.getElementById('pause-text'),
+  pauseHint: document.getElementById('pause-hint'),
+  btnResume: document.getElementById('btn-resume'),
+  zoneWarning: document.getElementById('zone-warning'),
   result: document.getElementById('result'),
   resultTitle: document.getElementById('result-title'),
   resultDetail: document.getElementById('result-detail'),
@@ -103,6 +108,12 @@ const state = {
   resultShown: false,
   myName: '',
   needSnap: true,
+  /** 이 브라우저에서 PointerLock을 쓸 수 없을 때(드래그 시점 대체 모드) */
+  lockUnavailable: false,
+  /** PointerLock 없이 마우스 드래그로 시점을 돌리는 중 */
+  lookDrag: false,
+  /** 나를 탈락시킨 상대(탈락 오버레이 표시용) */
+  myKiller: null,
   lastDryAt: 0,
   keys: new Set(),
   touchMove: { x: 0, y: 0, active: false },
@@ -155,10 +166,10 @@ if (renderer) {
   camera.rotation.order = 'YXZ';
   scene.add(camera);
 
-  const hemi = new THREE.HemisphereLight(0xa8d8ff, 0x1c2b26, 1.05);
+  const hemi = new THREE.HemisphereLight(0xa8d8ff, 0x1c2b26, 1.3);
   scene.add(hemi);
 
-  const dir = new THREE.DirectionalLight(0xfff0d4, 1.25);
+  const dir = new THREE.DirectionalLight(0xfff0d4, 1.5);
   dir.position.set(45, 80, 30);
   dir.castShadow = !isTouch;
   if (!isTouch) {
@@ -174,7 +185,7 @@ if (renderer) {
   }
   scene.add(dir);
 
-  const ambient = new THREE.AmbientLight(0x25333c, 0.55);
+  const ambient = new THREE.AmbientLight(0x25333c, 0.7);
   scene.add(ambient);
 }
 
@@ -200,7 +211,7 @@ function makeGroundTexture() {
   canvas.width = size;
   canvas.height = size;
   const ctx = canvas.getContext('2d');
-  ctx.fillStyle = '#161e25';
+  ctx.fillStyle = '#1c2732';
   ctx.fillRect(0, 0, size, size);
 
   const tile = 64;
@@ -211,7 +222,7 @@ function makeGroundTexture() {
       ctx.fillRect(x + 2, y + 2, tile - 4, tile - 4);
     }
   }
-  ctx.strokeStyle = 'rgba(80, 200, 170, 0.18)';
+  ctx.strokeStyle = 'rgba(80, 200, 170, 0.22)';
   ctx.lineWidth = 2;
   for (let i = 0; i <= size; i += tile) {
     ctx.beginPath();
@@ -307,7 +318,7 @@ function buildWorld(map) {
   zoneWall.scale.set(arena.half, 30, arena.half);
   scene.add(zoneWall);
 
-  const edgeGeo = new THREE.RingGeometry(0.985, 1.0, 128);
+  const edgeGeo = new THREE.RingGeometry(0.965, 1.0, 128);
   const edgeMat = new THREE.MeshBasicMaterial({ color: 0x7dd3fc, transparent: true, opacity: 0.75, side: THREE.DoubleSide });
   zoneEdge = new THREE.Mesh(edgeGeo, edgeMat);
   zoneEdge.rotation.x = -Math.PI / 2;
@@ -502,7 +513,14 @@ function nameSprite(name) {
   canvas.height = 64;
   const ctx = canvas.getContext('2d');
   ctx.clearRect(0, 0, canvas.width, canvas.height);
-  ctx.font = 'bold 30px "Pretendard", "Malgun Gothic", system-ui, sans-serif';
+  // 닉네임이 길어도 잘리지 않도록 폭에 맞춰 글자 크기를 줄인다.
+  const fontOf = (size) => `bold ${size}px "Pretendard", "Malgun Gothic", system-ui, sans-serif`;
+  let fontSize = 30;
+  ctx.font = fontOf(fontSize);
+  while (fontSize > 14 && ctx.measureText(name).width > canvas.width - 20) {
+    fontSize -= 2;
+    ctx.font = fontOf(fontSize);
+  }
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
   ctx.lineWidth = 6;
@@ -561,9 +579,17 @@ function createAvatar(id, name) {
   group.add(label);
 
   scene.add(group);
-  const avatar = { id, name, group, head, gun, label, buffer: [], lastSeen: performance.now() };
+  const avatar = { id, name, group, head, gun, label, weapon: 1, buffer: [], lastSeen: performance.now() };
   state.avatars.set(id, avatar);
   return avatar;
+}
+
+/** 원격 플레이어가 든 무기를 실루엣으로 구분할 수 있게 총 모델을 바꾼다. */
+function applyRemoteWeapon(avatar, weaponId) {
+  if (!avatar.gun) return;
+  if (weaponId === 2) avatar.gun.scale.set(0.9, 0.85, 0.55); // 권총: 짧은 총열
+  else if (weaponId === 3) avatar.gun.scale.set(1.22, 1.05, 1.2); // 샷건: 긴 총열
+  else avatar.gun.scale.set(1, 1, 1); // 라이플
 }
 
 function removeAvatar(id) {
@@ -663,8 +689,10 @@ function setupInput() {
   // 마우스 시점
   document.addEventListener('mousemove', (e) => {
     if (state.phase !== 'playing') return;
-    if (document.pointerLockElement !== dom.canvas) return;
-    if (state.ignoreMoves > 0) {
+    const locked = document.pointerLockElement === dom.canvas;
+    // PointerLock이 없는 브라우저에서는 마우스를 누른 채 드래그해 시점을 돌린다.
+    if (!locked && !(state.lockUnavailable && state.lookDrag)) return;
+    if (locked && state.ignoreMoves > 0) {
       state.ignoreMoves -= 1;
       return;
     }
@@ -677,6 +705,14 @@ function setupInput() {
     if (state.phase !== 'playing' || isTouch) return;
     if (e.button !== 0) return;
     if (document.pointerLockElement !== dom.canvas) {
+      // 잠금을 쓸 수 없는 환경이면 클릭 = 사격 + 드래그 시점으로 안내한다.
+      if (state.lockUnavailable) {
+        state.lookDrag = true;
+        audio.resume();
+        state.firing = true;
+        attemptShoot(performance.now());
+        return;
+      }
       requestLock();
       return;
     }
@@ -686,7 +722,10 @@ function setupInput() {
   });
 
   window.addEventListener('mouseup', (e) => {
-    if (e.button === 0) state.firing = false;
+    if (e.button === 0) {
+      state.firing = false;
+      state.lookDrag = false;
+    }
   });
 
   dom.canvas.addEventListener('click', () => {
@@ -706,12 +745,13 @@ function setupInput() {
       !isResultOpen() &&
       performance.now() > state.suppressPauseUntil
     ) {
-      dom.pause.classList.remove('hidden');
+      showPause('일시정지', '마우스 고정이 풀렸습니다. 계속하려면 아래 버튼을 누르거나 화면을 클릭하세요.');
       state.firing = false;
     }
   });
 
-  dom.pause.addEventListener('click', () => requestLock());
+  dom.pause.addEventListener('click', () => resumeFromPause());
+  dom.btnResume.addEventListener('click', () => resumeFromPause());
 
   // 모바일: 오른쪽 화면 드래그로 시점 회전
   dom.canvas.addEventListener('pointerdown', (e) => {
@@ -836,11 +876,60 @@ function addLook(dx, dy) {
   if (state.me.yaw < -Math.PI) state.me.yaw += Math.PI * 2;
 }
 
-function requestLock() {
-  if (isTouch) return;
+function requestLock(fromGesture = true) {
+  if (isTouch || state.lockUnavailable) return;
   if (document.pointerLockElement === dom.canvas) return;
-  const promise = dom.canvas.requestPointerLock?.();
-  if (promise && typeof promise.catch === 'function') promise.catch(() => {});
+  let promise;
+  try {
+    promise = dom.canvas.requestPointerLock?.();
+  } catch (err) {
+    if (fromGesture) onLockUnavailable();
+    return;
+  }
+  if (promise && typeof promise.catch === 'function') {
+    promise.catch(() => {
+      // 참여 직후처럼 사용자 제스처가 없을 때의 자동 잠금은 실패해도 대체 모드로 단정하지 않는다.
+      // (제스처에서 시도했는데 거절됐을 때만 '드래그 모드'로 안내한다.)
+      if (fromGesture) onLockUnavailable();
+    });
+  }
+}
+
+/** 일시정지/조준 고정 화면을 띄운다(버튼 하나로 돌아올 수 있게). */
+function showPause(title, text) {
+  dom.pauseTitle.textContent = title;
+  dom.pauseText.textContent = text;
+  dom.pause.classList.remove('hidden');
+}
+
+/** 일시정지 화면에서 게임으로 돌아간다. */
+function resumeFromPause() {
+  dom.pause.classList.add('hidden');
+  state.firing = false;
+  if (state.lockUnavailable) return; // 드래그 시점 모드에서는 그대로 플레이
+  requestLock();
+  if (document.pointerLockElement !== dom.canvas) {
+    // 브라우저가 잠금을 거절하면 다시 안내를 보여 준다(조용히 실패하지 않게).
+    window.setTimeout(() => {
+      if (!state.lockUnavailable && state.phase === 'playing' && !document.pointerLockElement) {
+        showPause('조준 고정 실패', '브라우저가 마우스 고정을 거절했습니다. 다시 눌러 보거나 ESC 뒤 캔버스를 클릭해 주세요.');
+      }
+    }, 400);
+  }
+}
+
+/**
+ * PointerLock을 쓸 수 없는 환경(헤드리스·일부 내장 브라우저·iframe) 대체 모드.
+ * 마우스를 누른 채 드래그해 시점을 돌리고, 클릭으로 사격한다.
+ */
+function onLockUnavailable() {
+  if (state.lockUnavailable) return;
+  state.lockUnavailable = true;
+  dom.pauseTitle.textContent = '조준 방식 안내';
+  dom.pauseText.textContent = '이 브라우저에서는 마우스 고정을 쓸 수 없습니다. 화면을 드래그해 시점을 돌리고, 클릭으로 사격하세요.';
+  dom.btnResume.textContent = '계속하기';
+  dom.pauseHint.textContent = '게임은 그대로 플레이할 수 있습니다.';
+  dom.pause.classList.add('hidden');
 }
 
 function onResize() {
@@ -1002,7 +1091,7 @@ function onWelcome(msg) {
   setLoading(false);
   audio.resume();
   if (!isTouch) {
-    requestLock();
+    requestLock(false); // 부트 직후 자동 시도 — 실패해도 일시정지 안내만 띄우고 대체 모드로 단정하지 않는다
     if (document.pointerLockElement !== dom.canvas) {
       dom.pause.classList.remove('hidden');
     }
@@ -1063,6 +1152,10 @@ function onSnapshot(snap) {
       let avatar = state.avatars.get(id);
       if (!avatar) avatar = createAvatar(id, name);
       avatar.lastSeen = now;
+      if (avatar.weapon !== weapon) {
+        avatar.weapon = weapon;
+        applyRemoteWeapon(avatar, weapon);
+      }
       if (alive) {
         avatar.group.visible = true;
         pushSample(avatar, x, z, yaw, pitch, now);
@@ -1116,6 +1209,7 @@ function onEvents(msg) {
         }
         if (ev.victimId === state.myId) {
           state.firing = false;
+          state.myKiller = { name: ev.killer || null, weapon: ev.weapon || null };
           state.suppressPauseUntil = performance.now() + 1200;
         }
         break;
@@ -1150,9 +1244,11 @@ function onEvents(msg) {
           dom.result.classList.add('hidden');
           dom.dead.classList.add('hidden');
           state.firing = false;
+          state.myKiller = null;
           cancelLocalReload();
         } else if (ev.phase === 'waiting') {
           dom.result.classList.add('hidden');
+          state.myKiller = null;
           cancelLocalReload();
         }
         break;
@@ -1255,25 +1351,55 @@ function updateHud() {
     dom.waitCount.textContent = `${state.round.total} / ${state.round.need}`;
   }
 
-  // 존
+  // 존: 1/3 ~ 3/3 단계로 표시한다(서버 stage 0 = 첫 단계 대기).
   if (state.zone) {
-    const seconds = Math.ceil(state.zone.nextIn / 1000);
+    const seconds = Math.max(0, Math.ceil(state.zone.nextIn / 1000));
     const mm = Math.floor(seconds / 60);
     const ss = String(seconds % 60).padStart(2, '0');
     dom.zoneTimer.textContent = `${mm}:${ss}`;
-    dom.zoneLabel.textContent = state.zone.shrinking ? '구역 축소 중' : `안전 구역 ${state.zone.stage}/3`;
+    const stageNo = Math.min(3, Math.max(1, state.zone.stage || 0));
+    if (state.zone.stage >= 3 && seconds === 0) dom.zoneLabel.textContent = '최종 구역';
+    else if (state.zone.shrinking) dom.zoneLabel.textContent = `구역 축소 중 (${stageNo}/3)`;
+    else dom.zoneLabel.textContent = `안전 구역 ${stageNo}/3`;
     dom.zoneBox.classList.toggle('shrinking', Boolean(state.zone.shrinking));
   }
+
+  // 구역 밖 경고: 실제 피해가 들어가는 상태(라운드 진행 중)에만 띄운다.
+  const zoneOutside =
+    Boolean(state.zone) &&
+    state.phase === 'playing' &&
+    me.alive &&
+    roundState === 'live' &&
+    Math.hypot(me.x - state.zone.centerX, me.z - state.zone.centerZ) > state.zone.radius;
+  dom.zoneWarning.classList.toggle('hidden', !zoneOutside);
 
   // 탈락(관전) 오버레이 — 배틀로얄은 라운드 중 리스폰이 없다.
   const roundEnded = Boolean(state.round && state.round.state === 'ended');
   const spectator = Boolean(state.phase === 'playing' && !me.alive && !roundEnded);
   dom.dead.classList.toggle('hidden', !spectator);
   if (spectator) {
-    dom.deadTitle.textContent = '탈락';
-    dom.deadTimer.textContent = '생존자 관전 중';
-    dom.deadHint.textContent = `남은 생존자 ${state.aliveCount}명 · 라운드가 끝날 때까지 리스폰되지 않습니다. 다음 라운드에서 다시 시작합니다.`;
+    if (state.myKiller) {
+      const weaponLabel = WEAPON_LABELS[state.myKiller.weapon] || '';
+      dom.deadTitle.textContent = '탈락';
+      dom.deadTimer.textContent = state.myKiller.name
+        ? `${state.myKiller.name} 님에게${weaponLabel ? ` [${weaponLabel}]` : ''} 탈락했습니다`
+        : '구역 밖에서 탈락했습니다';
+      dom.deadHint.textContent = `남은 생존자 ${state.aliveCount}명 · 라운드가 끝날 때까지 리스폰되지 않습니다. 다음 라운드에서 다시 시작합니다.`;
+    } else {
+      // 진행 중인 라운드에 새로 들어온 플레이어는 다음 라운드부터 참여한다.
+      dom.deadTitle.textContent = '관전';
+      dom.deadTimer.textContent = '진행 중인 라운드에 입장했습니다';
+      dom.deadHint.textContent = `남은 생존자 ${state.aliveCount}명 · 다음 라운드가 시작되면 함께 참여합니다.`;
+    }
   }
+
+  // 모바일 조작부는 살아 있을 때만 보인다(탈락·결과 화면에서 잘못 누르지 않게).
+  if (isTouch) {
+    dom.touchControls.classList.toggle('hidden', !(state.phase === 'playing' && me.alive && !roundEnded));
+  }
+
+  // 탈락 중에는 마우스 고정 안내가 관전 화면을 가리지 않도록 감춘다.
+  if (!me.alive && !dom.pause.classList.contains('hidden')) dom.pause.classList.add('hidden');
 
   const resultOpen = Boolean(state.round && state.round.state === 'ended' && state.phase === 'playing');
   if (resultOpen && !state.resultShown) {
@@ -1287,7 +1413,7 @@ function updateHud() {
   if (resultOpen) {
     if (state.round.winner) {
       const mine = state.round.winnerId === state.myId;
-      dom.resultTitle.textContent = mine ? '승리!' : '라운드 종료';
+      dom.resultTitle.textContent = mine ? '승리!' : me.alive ? '라운드 종료' : '패배';
       const how = state.round.reason === 'timeout' ? '시간 종료 · HP 우세로' : '마지막 생존자로';
       dom.resultDetail.textContent = `${state.round.winner} 님이 ${how} 승리했습니다. (${state.round.winnerKills}킬 · HP ${state.round.winnerHp})`;
     } else {
@@ -1295,6 +1421,21 @@ function updateHud() {
       dom.resultDetail.textContent = '이번 라운드는 승자가 없습니다.';
     }
     dom.resultCountdown.textContent = `${state.round.nextIn}초 후 자동으로 다음 라운드가 시작됩니다. 전원 부활·탄약·구역이 초기화됩니다. (${state.round.ready}/${state.round.total} 준비)`;
+  }
+
+  // 라운드가 진행 중인데 마우스 고정이 풀려 있으면(결과 창·ESC) 재고정 버튼을 띄운다.
+  if (
+    state.phase === 'playing' &&
+    !isTouch &&
+    !state.lockUnavailable &&
+    me.alive &&
+    roundState === 'live' &&
+    !resultOpen &&
+    document.pointerLockElement !== dom.canvas &&
+    dom.pause.classList.contains('hidden') &&
+    performance.now() > state.suppressPauseUntil
+  ) {
+    showPause('조준 다시 고정', '라운드가 진행 중입니다. 계속하려면 마우스를 다시 고정하세요.');
   }
 
   dom.ping.textContent = net.rtt ? `${net.rtt}ms` : '--ms';
@@ -1558,7 +1699,7 @@ function animate() {
       avatar.gun.rotation.x = -sample.pitch;
     }
 
-    // 존 시각화
+    // 존 시각화: 안·밖 어디서나 보이도록 벽을 은은하게 띄우고, 축소 중에는 색을 바꾼다.
     if (state.zone && zoneWall && zoneEdge) {
       const target = state.zone.radius;
       const current = zoneWall.scale.x;
@@ -1568,7 +1709,11 @@ function animate() {
       zoneEdge.scale.set(next, next, 1);
       zoneEdge.position.set(state.zone.centerX, 0.06, state.zone.centerZ);
       const outside = Math.hypot(state.me.x - state.zone.centerX, state.me.z - state.zone.centerZ) > target;
-      zoneWall.material.opacity = outside ? 0.16 : 0.07;
+      zoneWall.material.opacity = outside ? 0.24 : 0.12;
+      const shrinking = Boolean(state.zone.shrinking);
+      zoneWall.material.color.setHex(shrinking ? 0xfbbf24 : 0x38bdf8);
+      zoneEdge.material.color.setHex(shrinking ? 0xfbbf24 : outside ? 0xf87171 : 0x7dd3fc);
+      zoneEdge.material.opacity = outside ? 0.95 : 0.8;
     }
   }
 
