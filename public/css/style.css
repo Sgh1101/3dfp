@@ -935,6 +935,10 @@ input[type="text"]:focus {
   #btn-heal {
     height: 50px;
   }
+  /* 낮은 화면에서는 무기 이름표가 버튼과 겹치므로 숨긴다(무기 슬롯 줄이 대신 보여 준다). */
+  .weapon-name {
+    display: none;
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {
