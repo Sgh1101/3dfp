@@ -187,13 +187,17 @@ test('ESC로 풀린 뒤 명확한 재고정 버튼으로 돌아온다', () => {
 
 test('잠금 직후 마우스 값이 튀지 않도록 보정한다', () => {
   assert(/state\.ignoreMoves = 2/.test(js), '잠금 직후 이동값 무시가 없다');
-  assert(/Math\.abs\(e\.movementX\) > 260/.test(js), '비정상 movementX 필터가 없다');
+  assert(/Math\.abs\(e\.movementX\) > 300/.test(js), '비정상 movementX 필터가 없다');
 });
 
 test('PointerLock을 쓸 수 없는 환경에서는 드래그 시점으로 대체한다', () => {
   assert(/lockUnavailable/.test(js), '대체 모드 상태가 없다');
   assert(/onLockUnavailable/.test(js), '잠금 실패 처리 함수가 없다');
-  assert(/state\.lookDrag/.test(js), '드래그 시점 상태가 없다');
+  assert(/state\.dragLook/.test(js), '드래그 시점 상태가 없다');
+  // 잠금이 아예 안 되는 브라우저에서도 조준이 죽지 않도록 error/timeout 두 경로를 모두 둔다.
+  assert(/pointerlockerror/.test(js), 'pointerlockerror 처리이 없다');
+  assert(/LOCK_TIMEOUT_MS/.test(js), '잠금 실패 타임아웃이 없다');
+  assert(/addLook\(dx, dy\)/.test(js), '드래그 시점 회전 경로가 없다');
 });
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -215,17 +219,21 @@ test('가상 조이스틱 + 사격/재장전/무기/힐 버튼이 있다', () =>
   assert(/\.touch-btn \{[^}]*touch-action: none/.test(css), '버튼에 touch-action: none 이 없다');
 });
 
-test('멀티터치를 독립 pointer id 로 처리한다(조이스틱+사격 동시 입력)', () => {
+test('멀티터치를 독립 pointer id 로 처리한다(조이스틱+시점+사격+점프 동시 입력)', () => {
   assert(/e\.pointerId/.test(js), 'pointerId 기반 처리가 없다');
-  assert(/joystickId === e\.pointerId|e\.pointerId !== joystickId/.test(js), '조이스틱 pointer id 추적이 없다');
-  assert(/state\.look\.pointerId/.test(js), '시점 드래그 pointer id 추적이 없다');
+  assert(/e\.pointerId !== joystickId/.test(js), '조이스틱 pointer id 추적이 없다');
+  assert(/lookPointers/.test(js) && /lookPointers\.get\(e\.pointerId\)/.test(js), '시점 드래그 pointer id 추적이 없다');
   assert(/setPointerCapture/.test(js), 'pointer capture 로 동시 입력을 분리하지 않는다');
   assert(/pointercancel/.test(js), 'pointercancel 정리가 없다');
+  assert(/lostpointercapture/.test(js), '포인터 캡처 해제 정리가 없다');
 });
 
 test('오른쪽 화면 드래그로 시점을 돌리고 왼쪽은 조이스틱 영역이다', () => {
-  assert(/e\.clientX < window\.innerWidth \* 0\.35/.test(js), '시점 드래그 시작 영역 제한이 없다');
-  assert(/addLook\(dx \* 1\.7, dy \* 1\.7\)/.test(js), '터치 시점 감도 처리가 없다');
+  assert(/e\.clientX < window\.innerWidth \* 0\.22/.test(js), '시점 드래그 시작 영역 제한이 없다');
+  assert(/addLook\(dx \* TOUCH_SENSITIVITY, dy \* TOUCH_SENSITIVITY\)/.test(js), '터치 시점 감도 처리가 없다');
+  // 버튼/조이스틱 위에서 시작한 터치는 시점 드래그로 먹히지 않는다.
+  assert(/overControl\(e\.clientX, e\.clientY\)/.test(js), '조작 버튼 위 터치를 시점으로 빼앗는다');
+  assert(/pointermove/.test(js) && /last\.x = e\.clientX/.test(js), '터치 이동 델타 처리가 없다');
 });
 
 test('세로/가로(작은 높이) 레이아웃 대응이 있다', () => {
@@ -233,6 +241,88 @@ test('세로/가로(작은 높이) 레이아웃 대응이 있다', () => {
   assert(/@media \(max-height: 520px\)/.test(css), '낮은 높이(가로 모드) 브레이크포인트가 없다');
   assert(/@media \(prefers-reduced-motion: reduce\)/.test(css), '모션 감소 설정 대응이 없다');
   assert(/\.hidden \{[^}]*display: none !important/.test(css), '.hidden 규칙이 없다');
+});
+
+// ───────────────────────────────────────────────────────────────────────────
+section('점프 · 정조준 · 보급(루팅) · AI 대전');
+test('조작법 안내에 점프/정조준/앉기/달리기/줍기가 있다', () => {
+  const guide = html.slice(html.indexOf('controls-guide'), html.indexOf('</section>', html.indexOf('controls-guide')));
+  for (const key of ['Space', '우클릭', 'C / Ctrl', 'Shift', 'F']) {
+    assert(guide.includes(key), `조작법에 ${key} 항목이 없다`);
+  }
+  assert(/점프/.test(guide) && /정조준/.test(guide) && /앉기/.test(guide), '점프/정조준/앉기 설명이 없다');
+  assert(guide.includes('AI') || html.includes('AI와 바로 시작'), 'AI 대전 안내가 없다');
+});
+
+test('점프·정조준·앉기·달리기·줍기 입력이 서버 메시지로 연결된다', () => {
+  assert(/function requestJump\(/.test(js) && /t: 'jump'/.test(js), '점프 요청이 없다');
+  assert(/function setAds\(/.test(js) && /function toggleAds\(/.test(js), '정조준 함수가 없다');
+  assert(/e\.button === 2/.test(js), '우클릭 정조준 처리가 없다');
+  assert(/t: 'loot'/.test(js) && /function requestLoot\(/.test(js), '줍기 요청이 없다');
+  assert(/state\.me\.sprint/.test(js) && /ShiftLeft/.test(js), '달리기 입력이 없다');
+  assert(/KeyC|ControlLeft/.test(js), '앉기 입력이 없다');
+  // 이동 패킷에 자세가 함께 실려 서버가 탄퍼짐/피격 박스를 판정한다.
+  assert(/crouch: state\.me\.crouch/.test(js) && /sprint: state\.me\.sprint/.test(js) && /ads: state\.me\.ads/.test(js), '이동 패킷에 자세 정보가 없다');
+});
+
+test('수직 물리(중력·착지·엄폐물 위)를 클라이언트가 예측한다', () => {
+  assert(/function stepVertical\(/.test(js), '클라이언트 수직 예측이 없다');
+  assert(/function supportAtLocal\(/.test(js), '엄폐물 윗면 판정이 없다');
+  assert(/gravity/.test(js) && /jumpVelocity/.test(js), '물리 상수를 서버 설정에서 받지 않는다');
+  assert(/me\.y >= cover\.h - 0\.05/.test(js), '엄폐물 위에서 측면 충돌을 무시하지 않는다');
+});
+
+test('정조준은 화각 줌·감도 보정·화면 피드백을 준다', () => {
+  assert(/adsFov/.test(js), '무기별 정조준 화각이 없다');
+  assert(/adsSensitivity/.test(js), '정조준 감도 보정이 없다');
+  assert(/id="ads-overlay"/.test(html), '정조준 오버레이가 없다');
+  assert(/\.ads-overlay\.active \{[^}]*opacity: 1/.test(css), '정조준 오버레이 활성 스타일이 없다');
+  assert(/camera\.fov \+= \(targetFov - camera\.fov\)/.test(js), '화각 보간이 없다');
+});
+
+test('HUD 신규 요소(나침반·미니맵·피해숫자·킬배너·토스트·자세·소리)', () => {
+  for (const id of ['compass', 'minimap', 'ads-overlay', 'toast', 'kill-banner', 'kill-banner-text', 'damage-numbers', 'loot-hint', 'stance-badge', 'sound-toggle']) {
+    assert(idSet.has(id), `HUD 요소 #${id} 가 없다`);
+  }
+  assert(/function drawCompass\(/.test(js) && /function drawMinimap\(/.test(js), '나침반/미니맵 렌더가 없다');
+  assert(/function spawnDamageNumber\(/.test(js), '피해 숫자 표시가 없다');
+  assert(/function showKillBanner\(/.test(js), '킬 배너가 없다');
+  assert(/function showToast\(/.test(js), '획득 토스트가 없다');
+  assert(/sound-toggle/.test(css), '소리 토글 스타일이 없다');
+  assert(/localStorage\.getItem\('3dfp\.muted'\)/.test(js), '음소거 설정이 저장되지 않는다');
+});
+
+test('적 시인성: 네임태그·체력바·적 색 구분', () => {
+  assert(/function updateAvatarHealth\(/.test(js), '원격 체력바 갱신이 없다');
+  assert(/hpFill/.test(js) && /hpBg/.test(js), '체력바 스프라이트가 없다');
+  assert(/nameSprite\(name, isBot \? '#fcd34d' : '#fda4af'\)/.test(js), '적/AI 이름표 색 구분이 없다');
+});
+
+test('보급 아이템은 서버 권위(획득/체력/무기 판정)', () => {
+  assert(/net\.on\('looted'/.test(js), 'looted 패킷 처리가 없다');
+  assert(/net\.on\('noWeapon'/.test(js), '미보유 무기 거절 처리이 없다');
+  assert(/ownedAtStart/.test(js), '초기 보유 무기를 서버 설정에서 받지 않는다');
+  assert(/function updateLoot\(/.test(js) && /autoPickup/.test(js), '줍기/자동 줍기 처리가 없다');
+  // 클라이언트가 스스로 체력을 올리지 않는다(서버 패킷의 값만 반영).
+  assert(!/state\.me\.hp\s*\+=/.test(js), '클라이언트가 체력을 직접 올린다');
+  assert(!/state\.me\.owned\[[^\]]+\]\s*=\s*true/.test(js), '클라이언트가 무기 보유를 직접 바꾼다');
+});
+
+test('로비에서 AI 봇 수/난이도/빈자리 채우기를 고를 수 있다', () => {
+  for (const id of ['bot-count', 'bot-difficulty', 'bot-fill', 'auto-pickup', 'btn-ai']) {
+    assert(idSet.has(id), `로비 요소 #${id} 가 없다`);
+  }
+  assert(/payload\.bots = bots/.test(js) && /payload\.fillBots = fillBots/.test(js) && /payload\.difficulty = difficulty/.test(js), '봇 설정이 join 패킷에 실리지 않는다');
+  assert(/id="btn-quick"/.test(html) && /id="btn-create"/.test(html), '기존 사람 멀티플레이 진입 버튼이 남아 있지 않다');
+});
+
+test('모바일 버튼에 점프/조준/앉기/줍기가 있고 3열 격자로 겹치지 않는다', () => {
+  for (const id of ['btn-jump', 'btn-aim', 'btn-crouch', 'btn-loot']) {
+    assert(idSet.has(id), `터치 버튼 #${id} 가 없다`);
+  }
+  assert(/grid-template-columns: repeat\(3, 1fr\)/.test(css), '터치 버튼이 3열 격자가 아니다');
+  assert(/#btn-loot \{[^}]*grid-column: span 3/.test(css), '줍기 버튼 배치가 없다');
+  assert(/bindHoldButton\(dom\.btnJump/.test(js) && /bindHoldButton\(dom\.btnAim/.test(js), '점프/조준 버튼 핸들러가 없다');
 });
 
 // ───────────────────────────────────────────────────────────────────────────

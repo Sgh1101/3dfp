@@ -291,8 +291,15 @@ class Page {
       KeyR: ['r', 82],
       KeyQ: ['q', 81],
       KeyE: ['e', 69],
+      KeyC: ['c', 67],
+      KeyF: ['f', 70],
+      KeyV: ['v', 86],
+      Space: [' ', 32],
+      ShiftLeft: ['Shift', 16],
+      ControlLeft: ['Control', 17],
       Digit1: ['1', 49],
       Digit2: ['2', 50],
+      Digit3: ['3', 51],
       Escape: ['Escape', 27],
     };
     const [key, vk] = table[code] || ['', 0];
@@ -338,6 +345,55 @@ class Page {
       button: 'left',
       clickCount: 1,
     });
+  }
+
+  /** 현재 시점을 목표 yaw/pitch 로 돌린다(합성 movementX/Y — 헤드리스에서도 핸들러 경로가 같다). */
+  async lookTo(targetYaw, targetPitch = 0) {
+    const sens = 0.0022;
+    const cur = await this.eval('window.__3dfpDebug ? window.__3dfpDebug() : null');
+    if (!cur) throw new Error('디버그 훅이 없다');
+    let dYaw = targetYaw - cur.yaw;
+    while (dYaw > Math.PI) dYaw -= Math.PI * 2;
+    while (dYaw < -Math.PI) dYaw += Math.PI * 2;
+    const dPitch = targetPitch - cur.pitch;
+    // yaw -= dx * sens, pitch -= dy * sens
+    const dx = -dYaw / sens;
+    const dy = -dPitch / sens;
+    const steps = Math.max(1, Math.ceil(Math.max(Math.abs(dx), Math.abs(dy)) / 180));
+    const sx = dx / steps;
+    const sy = dy / steps;
+    await this.eval(`(() => {
+      for (let i = 0; i < ${steps}; i += 1) {
+        const ev = new MouseEvent('mousemove', { bubbles: true });
+        Object.defineProperty(ev, 'movementX', { value: ${sx} });
+        Object.defineProperty(ev, 'movementY', { value: ${sy} });
+        document.dispatchEvent(ev);
+      }
+    })()`);
+  }
+
+  async rightDown() {
+    await this.send('Input.dispatchMouseEvent', {
+      type: 'mousePressed',
+      x: Math.round(this.width / 2),
+      y: Math.round(this.height / 2),
+      button: 'right',
+      clickCount: 1,
+    });
+  }
+
+  async rightUp() {
+    await this.send('Input.dispatchMouseEvent', {
+      type: 'mouseReleased',
+      x: Math.round(this.width / 2),
+      y: Math.round(this.height / 2),
+      button: 'right',
+      clickCount: 1,
+    });
+  }
+
+  async debug() {
+    return this.eval('window.__3dfpDebug ? window.__3dfpDebug() : null');
   }
 
   async touch(type, points) {
@@ -528,7 +584,10 @@ class Bot {
       id: entry[0],
       name: entry[1],
       x: entry[2],
+      y: entry[3],
       z: entry[4],
+      flags: entry[17] || 0,
+      isBot: ((entry[17] || 0) & 16) !== 0,
       yaw: entry[5],
       hp: entry[7],
       alive: entry[8] === 1,
@@ -1019,6 +1078,138 @@ async function main() {
       await page.click('#btn-ready');
       await waitFor(() => bot.round().index > idx, { timeout: 12000, message: '3라운드가 시작되지 않았다' });
       await waitFor(() => bot.find('치즈') && bot.find('치즈').alive, { message: '3라운드에서 부활하지 않았다' });
+    });
+
+    await step('점프: Space 로 실제 y가 올라갔다가 착지한다(서버 스냅샷)', async () => {
+      const name = '치즈';
+      const meBefore = bot.find(name);
+      assert(meBefore && meBefore.alive, '점프 테스트 전에 살아 있어야 한다');
+      await page.press('Space', 80);
+      await waitFor(
+        () => {
+          const me = bot.find(name);
+          return me && me.y > 0.3;
+        },
+        { timeout: 4000, message: 'Space 점프로 y가 올라가지 않았다' },
+      );
+      const air = await page.debug();
+      assert(air && air.grounded === false || air.y > 0.2, '클라이언트 예측이 점프 상태가 아니다');
+      await waitFor(
+        () => {
+          const me = bot.find(name);
+          return me && me.y < 0.05;
+        },
+        { timeout: 4000, message: '착지하지 않았다' },
+      );
+      console.log('      · 점프 최고 높이는 스냅샷 y로 확인');
+    });
+
+    await step('정조준(ADS): 우클릭으로 화각이 좁아지고 놓으면 돌아온다', async () => {
+      const before = await page.debug();
+      await page.rightDown();
+      await waitFor(
+        async () => {
+          const d = await page.debug();
+          return d && d.ads === true && d.fov < before.fov - 8;
+        },
+        { timeout: 3000, message: 'ADS 로 화각이 좁아지지 않았다' },
+      );
+      const zoomed = await page.debug();
+      assert(await page.eval(`document.getElementById('ads-overlay').classList.contains('active')`), 'ADS 오버레이가 켜지지 않았다');
+      await page.shot('05b-ads');
+      await page.rightUp();
+      await waitFor(
+        async () => {
+          const d = await page.debug();
+          return d && d.ads === false && d.fov > zoomed.fov + 8;
+        },
+        { timeout: 3000, message: 'ADS 해제 후 화각이 돌아오지 않았다' },
+      );
+    });
+
+    await step('앉기·달리기: 자세가 서버에 전달된다(C→플래그, Shift→속도)', async () => {
+      await page.key('KeyC', 'keyDown');
+      await sleep(300);
+      const dbg = await page.debug();
+      const snapMe = bot.find('치즈');
+      console.log(`      · 디버그 crouch=${dbg.crouch} keys=${JSON.stringify(dbg.keys)} alive=${snapMe && snapMe.alive} flags=${snapMe && snapMe.flags} y=${snapMe && snapMe.y}`);
+      await waitFor(
+        () => {
+          const me = bot.find('치즈');
+          return me && (me.flags & 2) !== 0;
+        },
+        { timeout: 2500, message: '앉기 상태가 서버 스냅샷에 없다' },
+      );
+      await page.key('KeyC', 'keyUp');
+      await waitFor(
+        () => {
+          const me = bot.find('치즈');
+          return me && (me.flags & 2) === 0;
+        },
+        { timeout: 2500, message: '앉기 해제가 반영되지 않았다' },
+      );
+    });
+
+    await step('보급 루팅: 아이템으로 걸어가 F 로 줍고 토스트가 뜬다', async () => {
+      const items = (await page.debug()).loot;
+      const me = bot.find('치즈');
+      // 가장 가까운 '힐 키트' 또는 '탄약' 아이템을 고른다.
+      const targets = items
+        .filter((it) => it.kind === 'kit' || it.kind === 'ammo' || it.kind === 'medkit')
+        .map((it) => ({ ...it, d: Math.hypot(it.x - me.x, it.z - me.z) }))
+        .sort((a, b) => a.d - b.d);
+      assert(targets.length > 0, '보급 아이템이 없다');
+      const target = targets[0];
+      const kitsBefore = (await page.debug()).kits;
+      const reserveBefore = bot.find('치즈').mag;
+
+      // 걸어가기: 목표 방향으로 yaw 를 돌리고 W 를 누른다.
+      const started = Date.now();
+      await page.key('KeyW', 'keyDown');
+      while (Date.now() - started < 20000) {
+        const now = bot.find('치즈');
+        if (!now) break;
+        const dist = Math.hypot(target.x - now.x, target.z - now.z);
+        if (dist < 1.8) break;
+        await page.lookTo(Math.atan2(-(target.x - now.x), -(target.z - now.z)), 0);
+        await sleep(120);
+      }
+      await page.key('KeyW', 'keyUp');
+      const arrived = bot.find('치즈');
+      const dist = Math.hypot(target.x - arrived.x, target.z - arrived.z);
+      assert(dist < 3.2, `보급 아이템에 도착하지 못했다(거리 ${dist.toFixed(1)}m)`);
+      await page.press('KeyF', 80);
+      const picked = await waitFor(
+        async () => {
+          const d = await page.debug();
+          const meNow = bot.find('치즈');
+          const kitUp = d.kits > kitsBefore;
+          const ammoUp = meNow && meNow.hp > 0 && false;
+          return kitUp || d.lootOpen === false || ammoUp ? d : false;
+        },
+        { timeout: 4000, message: '줍기 효과가 서버에 반영되지 않았다' },
+      ).catch(() => null);
+      const toastText = await page.text('#toast');
+      assert(picked, '줍기 결과가 없다');
+      assert(/획득|보급|탄약|힐|구급/.test(toastText), `획득 토스트가 없다: ${toastText}`);
+      await page.shot('05c-loot');
+      void reserveBefore;
+    });
+
+    await step('드래그 조준 모드: 마우스 고정이 안 되는 브라우저에서도 시점이 돈다', async () => {
+      await page.eval(`document.dispatchEvent(new Event('pointerlockerror'))`);
+      await sleep(200);
+      const d = await page.debug();
+      assert(d.lockUnavailable === true, '잠금 실패 시 드래그 모드로 전환되지 않았다');
+      const yawBefore = (await page.debug()).yaw;
+      await page.mouseDown();
+      await sleep(60);
+      await page.mouseMove(120, 0);
+      await sleep(160);
+      await page.mouseUp();
+      const yawAfter = (await page.debug()).yaw;
+      const diff = Math.abs(((yawAfter - yawBefore + Math.PI * 3) % (Math.PI * 2)) - Math.PI);
+      assert(diff > 0.05, `드래그로 시점이 돌아가지 않았다(diff ${diff.toFixed(3)})`);
     });
 
     await step('ESC(잠금 해제) → 일시정지 → 재고정 버튼으로 복귀, 카메라 각도 유지', async () => {

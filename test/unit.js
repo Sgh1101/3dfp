@@ -11,10 +11,20 @@ const {
   sanitizeName,
   rayAABB,
   resolveCollisions,
+  supportAt,
+  spreadMultiplier,
   publicConfig,
   MIN_PLAYERS_TO_START,
   INTERMISSION_MS,
+  GRAVITY,
+  JUMP_VY,
+  CROUCH_EYE_HEIGHT,
+  EYE_HEIGHT,
+  HEADSHOT_MULT,
+  LOOT_RANGE,
+  BOT_DIFFICULTY,
 } = require('../server/game');
+const { BotDirector } = require('../server/bots');
 const { RoomManager, ERROR, MAX_PLAYERS_PER_ROOM } = require('../server/rooms');
 const { RateLimiter, BackpressureGuard, MAX_BUFFERED_BYTES } = require('../server/limits');
 const { COVERS, SPAWNS, ARENA } = require('../server/map');
@@ -38,6 +48,12 @@ function newGame() {
   return new Game('TEST01', false);
 }
 
+function newBotGame(botOptions = { count: 1, difficulty: 'normal' }) {
+  const game = new Game('TEST02', false, botOptions);
+  game.botBrain = new BotDirector(game);
+  return game;
+}
+
 function addPlayers(game, specs) {
   return specs.map(([id, name]) => game.addPlayer(id, name));
 }
@@ -46,6 +62,9 @@ function addPlayers(game, specs) {
 function place(player, x, z, yaw = 0, pitch = 0) {
   player.x = x;
   player.z = z;
+  player.y = 0;
+  player.vy = 0;
+  player.grounded = true;
   player.yaw = yaw;
   player.pitch = pitch;
   player.spawnProtectUntil = 0;
@@ -187,7 +206,8 @@ test('정면 사격이 명중하고 피해를 준다', () => {
   const [a, b] = addPlayers(game, [['a', '알파'], ['b', '베타']]);
   place(a, 60, 0, Math.PI, 0); // +Z 방향
   place(b, 60, 10, 0, 0);
-  game.handleShoot('a', { yaw: Math.PI, pitch: 0 });
+  // 가슴(1.1m)을 겨냥한 몸통 사격
+  game.handleShoot('a', { yaw: Math.PI, pitch: Math.atan2(1.1 - EYE_HEIGHT, 10) });
   assert.strictEqual(b.hp, 100 - 24);
   assert.strictEqual(a.mag[1], 29);
 });
@@ -286,10 +306,344 @@ test('무기 교체가 동작한다', () => {
   const game = newGame();
   const [a] = addPlayers(game, [['a', '알파']]);
   place(a, 60, 0);
-  game.handleSwap('a', { w: 3 });
-  assert.strictEqual(a.weapon, 3);
+  // 샷건은 기본 지급이 아니므로 1↔2만 순환한다.
+  game.handleSwap('a', {});
+  assert.strictEqual(a.weapon, 2);
   game.handleSwap('a', {});
   assert.strictEqual(a.weapon, 1);
+});
+
+test('보유하지 않은 무기(샷건)로는 바꿀 수 없다', () => {
+  const game = newGame();
+  const [a] = addPlayers(game, [['a', '알파']]);
+  place(a, 60, 0);
+  game.drainDirect();
+  game.handleSwap('a', { w: 3 });
+  assert.strictEqual(a.weapon, 1, '서버가 보유하지 않은 무기를 허용했다');
+  const direct = game.drainDirect();
+  assert.ok(direct.some((d) => d.message.t === 'noWeapon'), 'noWeapon 통보가 없다');
+});
+
+console.log('[unit] 보급 아이템(루팅)');
+test('무기 아이템을 주우면 샷건을 획득하고 그 무기로 바뀐다', () => {
+  const game = newGame();
+  const [a] = addPlayers(game, [['a', '알파']]);
+  place(a, 60, 0);
+  const item = game.items.find((it) => it.kind === 'weapon');
+  a.x = item.x;
+  a.z = item.z;
+  game.handleLoot('a');
+  assert.strictEqual(a.owned[3], true, '샷건 보유가 서버에 반영되지 않았다');
+  assert.strictEqual(a.weapon, 3, '획득한 무기로 바뀌지 않았다');
+  assert.strictEqual(a.mag[3], 6);
+  assert.ok(item.readyAt > Date.now(), '아이템이 소모되지 않았다(무한 파밍)');
+  const direct = game.drainDirect();
+  assert.ok(direct.some((d) => d.message.t === 'looted' && d.message.weapon === 3), 'looted 통보가 없다');
+});
+
+test('탄약·힐·구급상자 효과는 서버가 계산한다', () => {
+  const game = newGame();
+  const [a] = addPlayers(game, [['a', '알파']]);
+  place(a, 60, 0);
+  // 탄약
+  a.reserve[1] = 10;
+  const ammo = game.items.find((it) => it.kind === 'ammo');
+  a.x = ammo.x;
+  a.z = ammo.z;
+  game.handleLoot('a');
+  assert.ok(a.reserve[1] > 10, '탄약이 보충되지 않았다');
+
+  // 힐 키트
+  a.kits = 0;
+  const kit = game.items.find((it) => it.kind === 'kit');
+  a.x = kit.x;
+  a.z = kit.z;
+  game.handleLoot('a');
+  assert.strictEqual(a.kits, 1, '힐 키트가 지급되지 않았다');
+
+  // 구급상자: 즉시 회복
+  a.hp = 40;
+  const med = game.items.find((it) => it.kind === 'medkit');
+  a.x = med.x;
+  a.z = med.z;
+  game.handleLoot('a');
+  assert.ok(a.hp > 40, '구급상자로 회복되지 않았다');
+  assert.ok(a.hp <= 100, 'HP 상한을 넘었다');
+});
+
+test('범위 밖·재사용 대기 중 아이템은 지급되지 않는다', () => {
+  const game = newGame();
+  const [a] = addPlayers(game, [['a', '알파']]);
+  place(a, 0, -60);
+  a.reserve[1] = 10;
+  const ammo = game.items.find((it) => it.kind === 'ammo');
+  a.x = ammo.x + LOOT_RANGE + 1;
+  a.z = ammo.z;
+  game.handleLoot('a');
+  assert.strictEqual(a.reserve[1], 10, '멀리서 아이템을 주웠다');
+
+  // 범위 안에서 줍고, 곧바로 다시 시도하면 재사용 대기로 거절된다.
+  a.x = ammo.x;
+  game.handleLoot('a');
+  const after = a.reserve[1];
+  game.handleLoot('a');
+  assert.strictEqual(a.reserve[1], after, '재사용 대기 중인 아이템이 또 지급됐다');
+});
+
+test('이미 가득 찬 상태에서는 아이템을 소모하지 않는다', () => {
+  const game = newGame();
+  const [a] = addPlayers(game, [['a', '알파']]);
+  place(a, 60, 0);
+  const med = game.items.find((it) => it.kind === 'medkit');
+  a.x = med.x;
+  a.z = med.z;
+  a.hp = 100;
+  game.handleLoot('a');
+  assert.strictEqual(med.readyAt, 0, 'HP가 가득인데 구급상자가 소모됐다');
+});
+
+console.log('[unit] 점프·앉기(수직 물리·판정)');
+test('점프하면 y가 올라가고 중력으로 다시 0에 착지한다', () => {
+  const game = newGame();
+  const [a] = addPlayers(game, [['a', '알파']]);
+  place(a, 60, 0);
+  game.handleJump('a');
+  assert.ok(a.vy > 0, '점프 속도가 없다');
+  assert.strictEqual(a.grounded, false);
+  let maxY = 0;
+  const t0 = Date.now();
+  for (let i = 1; i <= 30; i += 1) {
+    game.tick(t0 + i * 50);
+    maxY = Math.max(maxY, a.y);
+  }
+  assert.ok(maxY > 1.2, `점프 높이가 너무 낮다: ${maxY.toFixed(2)}m`);
+  assert.ok(maxY < 2.6, `점프가 너무 높다: ${maxY.toFixed(2)}m`);
+  assert.strictEqual(a.y, 0, `착지하지 않았다: y=${a.y}`);
+  assert.strictEqual(a.grounded, true);
+  const events = game.drainEvents();
+  assert.ok(events.some((e) => e.k === 'jump' && e.id === 'a'), 'jump 이벤트가 없다');
+  assert.ok(events.some((e) => e.k === 'land' && e.id === 'a'), 'land 이벤트가 없다');
+});
+
+test('공중에서는 두 번 점프할 수 없다(서버 권위)', () => {
+  const game = newGame();
+  const [a] = addPlayers(game, [['a', '알파']]);
+  place(a, 60, 0);
+  game.handleJump('a');
+  const vyAfterFirst = a.vy;
+  game.tick(Date.now() + 50);
+  game.handleJump('a');
+  assert.ok(a.vy <= vyAfterFirst, '공중에서 점프가 중첩됐다');
+});
+
+test('스냅샷의 y가 점프 중 실제 높이를 담는다', () => {
+  const game = newGame();
+  addPlayers(game, [['a', '알파'], ['b', '베타']]);
+  const a = game.players.get('a');
+  place(a, 60, 0);
+  game.handleJump('a');
+  game.tick(Date.now() + 250);
+  game.tick(Date.now() + 300);
+  const snap = game.snapshot();
+  const me = snap.players.find((p) => p[0] === 'a');
+  assert.ok(me[3] > 0.5, `스냅샷 y가 0이다: ${me[3]}`);
+});
+
+test('사격 원점(눈높이)이 점프·앉기 y를 그대로 반영한다', () => {
+  const game = newGame();
+  const [a] = addPlayers(game, [['a', '알파'], ['b', '베타']]);
+  forceLive(game);
+  place(a, 60, 0, Math.PI, 0);
+  game.handleShoot('a', { yaw: Math.PI, pitch: 0 });
+  let shot = game.drainEvents().find((e) => e.k === 'shot');
+  assert.ok(Math.abs(shot.from[1] - EYE_HEIGHT) < 0.02, `서 있을 때 눈높이가 ${shot.from[1]}`);
+
+  a.nextShotAt = 0;
+  a.crouch = true;
+  game.handleShoot('a', { yaw: Math.PI, pitch: 0 });
+  shot = game.drainEvents().find((e) => e.k === 'shot');
+  assert.ok(Math.abs(shot.from[1] - CROUCH_EYE_HEIGHT) < 0.02, `앉았을 때 눈높이가 ${shot.from[1]}`);
+
+  a.nextShotAt = 0;
+  a.crouch = false;
+  a.y = 1.2;
+  a.vy = 0;
+  a.grounded = false;
+  game.handleShoot('a', { yaw: Math.PI, pitch: 0 });
+  shot = game.drainEvents().find((e) => e.k === 'shot');
+  assert.ok(Math.abs(shot.from[1] - (1.2 + EYE_HEIGHT)) < 0.03, `점프 중 눈높이가 ${shot.from[1]}`);
+});
+
+test('1.6m 상자 뒤 적은 서 있으면 머리가 노출되어 맞고, 앉으면 가려진다', () => {
+  const game = newGame();
+  const [a, b] = addPlayers(game, [['a', '알파'], ['b', '베타']]);
+  // 상자(7.4, 7.4) 뒤에 b를, 앞에 a를 둔다(둘 다 지상).
+  place(a, 7.4, 3.5, Math.PI, 0);
+  place(b, 7.4, 9.6, 0, 0);
+  // 머리(1.7m) 높이로 겨냥
+  const pitch = Math.atan2(1.7 - EYE_HEIGHT, 6.1);
+  game.handleShoot('a', { yaw: Math.PI, pitch });
+  assert.ok(b.hp < 100, '상자 위로 나온 머리를 맞히지 못했다');
+
+  // 앉으면 머리가 1.22m 아래로 내려가 상자(1.6m)에 완전히 가려진다.
+  b.hp = 100;
+  b.crouch = true;
+  a.nextShotAt = 0;
+  a.mag[1] = 30;
+  game.handleShoot('a', { yaw: Math.PI, pitch });
+  assert.strictEqual(b.hp, 100, '앉아서 가려진 적을 맞혔다');
+});
+
+test('마지막 생존자 판정에서 탈락한 뒤 y가 0으로 돌아간다(허공 판정 방지)', () => {
+  const game = newGame();
+  const [a, b] = addPlayers(game, [['a', '알파'], ['b', '베타']]);
+  place(a, 60, 0, Math.PI, 0);
+  place(b, 60, 6, 0, 0);
+  b.y = 1.4;
+  b.grounded = false;
+  b.hp = 5;
+  game.handleShoot('a', { yaw: Math.PI, pitch: 0 });
+  assert.strictEqual(b.alive, false);
+  assert.strictEqual(b.y, 0, '탈락자의 높이가 남아 있다');
+});
+
+test('supportAt이 바닥과 엄폐물 윗면을 구분한다', () => {
+  assert.strictEqual(supportAt(0, -40, 0), 0);
+  assert.strictEqual(supportAt(0, 0, 3), 2.6, '중앙 블록 윗면을 찾지 못했다');
+  assert.strictEqual(supportAt(0, 0, 0), 0, '블록 옆(지상)인데 윗면으로 올렸다');
+});
+
+console.log('[unit] AI 봇');
+test('방 만든 사람의 봇 설정대로 사람+AI 가 채워진다', () => {
+  const game = newBotGame({ count: 3, difficulty: 'hard' });
+  addPlayers(game, [['h', '사람']]);
+  assert.strictEqual(game.humanCount, 1);
+  assert.strictEqual(game.botCount, 3, `봇이 ${game.botCount}명이다`);
+  assert.strictEqual(game.playerCount, 4);
+  const bot = [...game.players.values()].find((p) => p.isBot);
+  assert.strictEqual(bot.name.startsWith('봇'), true);
+  assert.ok(bot.ai, '봇 두뇌 상태가 없다');
+});
+
+test('빈자리 채우기(fill)는 사람+AI 합산 8명을 유지한다', () => {
+  const game = newBotGame({ count: 0, fill: true, difficulty: 'normal' });
+  addPlayers(game, [['h1', '사람1']]);
+  assert.strictEqual(game.playerCount, 8, `봇 포함 ${game.playerCount}명`);
+  addPlayers(game, [['h2', '사람2']]);
+  assert.strictEqual(game.playerCount, 8);
+  assert.strictEqual(game.humanCount, 2);
+  assert.strictEqual(game.botCount, 6);
+  assert.ok(game.playerCount <= 8, '정원 8명을 넘었다');
+});
+
+test('사람이 모두 나가면 봇도 정리된다(빈 방 유지 방지)', () => {
+  const game = newBotGame({ count: 2 });
+  addPlayers(game, [['h', '사람']]);
+  assert.ok(game.botCount > 0);
+  game.removePlayer('h');
+  assert.strictEqual(game.humanCount, 0);
+  assert.strictEqual(game.botCount, 0, '사람이 없는데 봇이 남았다');
+  assert.strictEqual(game.playerCount, 0);
+});
+
+test('봇은 벽 너머 적을 보지 못한다(시야선 검사)', () => {
+  const game = newBotGame({ count: 1, difficulty: 'hard' });
+  const h = addPlayers(game, [['h', '사람']])[0];
+  const bot = [...game.players.values()].find((p) => p.isBot);
+  const director = game.botBrain;
+  // 중앙 블록(10x10, 2.6m)을 사이에 두고 마주 세운다.
+  place(h, 0, 14);
+  place(bot, 0, -14);
+  const visible = director.hasLineOfSight(director.eyeOf(bot), { x: h.x, y: h.y + 1.2, z: h.z });
+  assert.strictEqual(visible, false, '벽 너머를 보는 것으로 판정됐다');
+  // 벽이 없는 쪽으로 옮기면 보인다.
+  place(h, 30, -14);
+  const visible2 = director.hasLineOfSight(director.eyeOf(bot), { x: h.x, y: h.y + 1.2, z: h.z });
+  assert.strictEqual(visible2, true, '트인 곳인데 시야가 없다고 판정했다');
+});
+
+test('봇은 시야가 트인 사거리에서만 사격하고 탄약/탄퍼짐은 사람과 동일 규칙을 쓴다', () => {
+  const game = newBotGame({ count: 1, difficulty: 'hard' });
+  const h = addPlayers(game, [['h', '사람']])[0];
+  const bot = [...game.players.values()].find((p) => p.isBot);
+  // 중앙 블록 뒤: 쏘지 않아야 한다.
+  place(h, 0, 12);
+  place(bot, 0, -12);
+  game.round.state = 'live';
+  const t0 = Date.now();
+  for (let i = 0; i < 20; i += 1) game.tick(t0 + i * 50);
+  assert.strictEqual(h.hp, 100, '벽 너머인데 피해를 입었다');
+  // 트인 거리로 옮기면(반응 시간 뒤) 쏜다.
+  place(h, 42, 4);
+  place(bot, 30, 4);
+  bot.mag[1] = 30;
+  bot.nextShotAt = 0;
+  let shots = 0;
+  const start = Date.now();
+  while (Date.now() - start < 1500) {
+    // handleShoot은 실제 시계를 쓰므로 실제 시간으로 돌린다.
+    game.tick(Date.now());
+    shots = game.events.filter((e) => e.k === 'shot' && e.id === bot.id).length;
+    if (shots > 0) break;
+    // 바쁜 대기 대신 수면
+    const until = Date.now() + 40;
+    while (Date.now() < until) {
+      /* 대기 */
+    }
+  }
+  assert.ok(shots > 0, '시야가 트였는데 봇이 쏘지 않았다');
+  assert.ok(bot.mag[1] < 30, '봇 사격이 탄약을 쓰지 않았다');
+});
+
+test('봇 난이도는 반응 시간과 조준 오차로 조절된다', () => {
+  assert.ok(BOT_DIFFICULTY.easy.reactionMs > BOT_DIFFICULTY.hard.reactionMs, '난이도별 반응 시간 차이가 없다');
+  assert.ok(BOT_DIFFICULTY.easy.aimError > BOT_DIFFICULTY.hard.aimError, '난이도별 조준 오차 차이가 없다');
+});
+
+test('사람+AI로 라운드가 시작되고 탈락 시 마지막 생존자 판정이 동작한다', () => {
+  const game = newBotGame({ count: 1, difficulty: 'easy' });
+  const h = addPlayers(game, [['h', '사람']])[0];
+  const bot = [...game.players.values()].find((p) => p.isBot);
+  assert.strictEqual(game.round.state, 'live', '사람+AI 2명인데 라운드가 시작되지 않았다');
+  assert.strictEqual(game.round.startedWith, 2);
+  assert.strictEqual(game.aliveCount, 2);
+
+  // 사람이 봇을 죽인다.
+  place(h, 60, 0, Math.PI, 0);
+  place(bot, 60, 6, 0, 0);
+  bot.hp = 10;
+  game.handleShoot('h', { yaw: Math.PI, pitch: 0 });
+  assert.strictEqual(bot.alive, false);
+  game.tick(Date.now());
+  assert.strictEqual(game.round.state, 'ended');
+  assert.strictEqual(game.round.winner.id, 'h');
+
+  // 다음 라운드에서 봇도 함께 부활한다.
+  game.tick(game.round.nextRoundAt + 1);
+  assert.strictEqual(game.round.state, 'live');
+  assert.strictEqual(bot.alive, true, '봇이 다음 라운드에 부활하지 않았다');
+});
+
+test('방 정원은 사람+AI 합산 8명이다', () => {
+  const { RoomManager } = require('../server/rooms');
+  const rooms = new RoomManager({ maxRooms: 4 });
+  const { room } = rooms.join({ create: true, bots: 7, difficulty: 'normal' }, 'h1', '사람1');
+  // 봇 7 + 사람 1 = 8
+  assert.strictEqual(room.game.playerCount, 8);
+  // 가득 찼지만 봇이 있으므로 사람이 들어오면 봇이 비켜 준다.
+  const second = rooms.join({ code: room.code }, 'h2', '사람2');
+  assert.ok(second.room, `사람이 들어가지 못했다: ${second.error && second.error.code}`);
+  assert.ok(room.game.playerCount <= 8, `정원 초과: ${room.game.playerCount}`);
+  assert.strictEqual(room.game.humanCount, 2);
+  assert.strictEqual(room.game.botCount, 6);
+  // 호스트가 나가면 정원 맞춤(fill 아님)은 유지된다.
+  rooms.join({ code: room.code }, 'h3', '사람3');
+  rooms.join({ code: room.code }, 'h4', '사람4');
+  rooms.join({ code: room.code }, 'h5', '사람5');
+  rooms.join({ code: room.code }, 'h6', '사람6');
+  assert.ok(room.game.playerCount <= 8, `정원 초과: ${room.game.playerCount}`);
+  assert.strictEqual(room.game.humanCount, 6);
+  assert.ok(room.game.botCount <= 2, `봇이 자리를 비우지 않았다: ${room.game.botCount}`);
 });
 
 console.log('[unit] P2-2 무기 교체 시 재장전 취소');
@@ -303,8 +657,8 @@ test('재장전 중 무기를 바꾸면 재장전이 취소된다', () => {
   game.handleReload('a');
   assert.ok(a.reloadEnd > 0, '재장전이 시작되지 않았다');
   game.drainDirect();
-  game.handleSwap('a', { w: 3 });
-  assert.strictEqual(a.weapon, 3);
+  game.handleSwap('a', { w: 2 });
+  assert.strictEqual(a.weapon, 2);
   assert.strictEqual(a.reloadEnd, 0, '무기를 바꿨는데 재장전 타이머가 남아 있다');
   assert.strictEqual(a.reloadWeapon, 0);
   const direct = game.drainDirect();

@@ -63,6 +63,9 @@
 
     <!-- ── HUD ─────────────────────────────────────────────── -->
     <div id="hud" class="hud hidden" aria-live="polite">
+      <canvas id="compass" class="compass" width="300" height="40" aria-hidden="true"></canvas>
+      <canvas id="minimap" class="minimap" width="140" height="140" aria-label="미니맵"></canvas>
+
       <div class="hud-top">
         <div class="zone-box">
           <div class="zone-line"><span class="zone-dot"></span><span id="zone-label">안전 구역</span></div>
@@ -88,6 +91,11 @@
 
       <div class="zone-warning hidden" id="zone-warning">구역 밖 — 초당 피해를 받고 있습니다. 원 안으로 이동하세요.</div>
 
+      <div class="ads-overlay" id="ads-overlay" aria-hidden="true">
+        <div class="ads-ring"></div>
+        <div class="ads-dot"></div>
+      </div>
+
       <div class="crosshair" id="crosshair">
         <span class="ch ch-t"></span>
         <span class="ch ch-b"></span>
@@ -95,6 +103,11 @@
         <span class="ch ch-r"></span>
         <span class="hitmarker" id="hitmarker"></span>
       </div>
+      <div class="damage-numbers" id="damage-numbers" aria-hidden="true"></div>
+      <div class="kill-banner" id="kill-banner" aria-live="polite"><span id="kill-banner-text">적 처치!</span></div>
+      <div class="loot-hint hidden" id="loot-hint">보급 줍기 — F</div>
+      <div class="stance-badge hidden" id="stance-badge"></div>
+      <div class="toast" id="toast" role="status"></div>
 
       <div class="hud-bottom">
         <div class="hp-box">
@@ -113,6 +126,7 @@
       <div class="reload-hint hidden" id="reload-hint">재장전 중…</div>
       <div class="damage-vignette" id="damage-vignette"></div>
       <div class="ping" id="ping">--ms</div>
+      <button id="sound-toggle" class="sound-toggle" type="button" title="소리 끄기">🔊</button>
     </div>
 
     <!-- ── 모바일 터치 조작 ────────────────────────────────── -->
@@ -121,10 +135,14 @@
         <div class="joystick-knob" id="joystick-knob"></div>
       </div>
       <div class="touch-buttons">
-        <button class="touch-btn btn-fire" id="btn-fire" type="button">발사</button>
+        <button class="touch-btn btn-jump" id="btn-jump" type="button">점프</button>
+        <button class="touch-btn btn-aim" id="btn-aim" type="button">조준</button>
+        <button class="touch-btn btn-crouch" id="btn-crouch" type="button">앉기</button>
         <button class="touch-btn" id="btn-reload" type="button">재장전</button>
         <button class="touch-btn" id="btn-swap" type="button">무기</button>
         <button class="touch-btn" id="btn-heal" type="button">힐</button>
+        <button class="touch-btn btn-loot" id="btn-loot" type="button">줍기</button>
+        <button class="touch-btn btn-fire" id="btn-fire" type="button">발사</button>
       </div>
     </div>
 
@@ -133,7 +151,7 @@
       <div class="panel">
         <header class="panel-head">
           <h1>3D<span>FP</span></h1>
-          <p class="subtitle">3D 1인칭 멀티플레이어 브라우저 FPS · 배틀로얄(노리스폰) v0.3</p>
+          <p class="subtitle">3D 1인칭 멀티플레이어 브라우저 FPS · 배틀로얄(노리스폰) + AI 대전 v0.4</p>
         </header>
 
         <div class="field">
@@ -149,9 +167,32 @@
           </div>
         </div>
 
+        <div class="bot-setup">
+          <div class="bot-row">
+            <label for="bot-count">AI 봇</label>
+            <select id="bot-count" aria-label="AI 봇 수">
+              <option value="0">없음</option>
+              <option value="1">1명</option>
+              <option value="2">2명</option>
+              <option value="3" selected>3명</option>
+              <option value="5">5명</option>
+              <option value="7">7명</option>
+            </select>
+            <label for="bot-difficulty">난이도</label>
+            <select id="bot-difficulty" aria-label="AI 난이도">
+              <option value="easy">쉬움</option>
+              <option value="normal" selected>보통</option>
+              <option value="hard">어려움</option>
+            </select>
+          </div>
+          <label class="check"><input id="bot-fill" type="checkbox" /> <span>빈자리를 AI로 채우기 (사람+AI 8명 유지)</span></label>
+          <label class="check"><input id="auto-pickup" type="checkbox" checked /> <span>보급 자동 줍기</span></label>
+        </div>
+
         <div class="menu-actions">
-          <button id="btn-quick" class="btn btn-wide" type="button">기본 공개방 빠른 참여</button>
-          <button id="btn-create" class="btn btn-ghost btn-wide" type="button">새 방 만들기</button>
+          <button id="btn-quick" class="btn btn-wide" type="button">기본 공개방 빠른 참여 (사람끼리)</button>
+          <button id="btn-ai" class="btn btn-primary btn-wide" type="button">AI와 바로 시작 (봇 3 · 보통)</button>
+          <button id="btn-create" class="btn btn-ghost btn-wide" type="button">새 방 만들기 (위 AI 설정 적용)</button>
         </div>
 
         <div class="error hidden" id="menu-error" role="alert"></div>
@@ -160,14 +201,20 @@
           <h2>조작법</h2>
           <ul>
             <li><b>W A S D</b> 이동</li>
+            <li><b>Shift</b> 달리기</li>
+            <li><b>Space</b> 점프</li>
+            <li><b>C / Ctrl</b> 앉기</li>
             <li><b>마우스</b> 조준 (클릭하면 마우스 고정)</li>
+            <li><b>우클릭</b> 정조준 (ADS · V 토글)</li>
             <li><b>클릭</b> 사격</li>
             <li><b>R</b> 재장전</li>
             <li><b>E</b> 무기 교체 (1 라이플 · 2 권총 · 3 샷건)</li>
+            <li><b>F</b> 보급 줍기</li>
             <li><b>Q</b> 힐 키트 사용</li>
             <li><b>ESC</b> 마우스 고정 해제</li>
           </ul>
-          <p class="guide-note">모바일: 왼쪽 조이스틱 이동 · 오른쪽 화면 드래그로 조준 · 버튼으로 사격/재장전/무기/힐</p>
+          <p class="guide-note">모바일: 왼쪽 조이스틱 이동 · 오른쪽 화면 드래그로 조준 · 버튼으로 점프/조준/앉기/사격/재장전/무기/힐/줍기</p>
+          <p class="guide-note">무기 감각: 라이플은 연사, 권총은 단발, 샷건은 맵에서 주워야 한다. 정조준·앉기는 정확도가 올라가고, 달리기·점프 중에는 탄이 퍼진다.</p>
           <p class="guide-note">브라우저: WebGL을 지원하는 최신 Chrome · Edge · Safari · Firefox에서 동작합니다.</p>
           <p class="guide-note">
             <b>배틀로얄</b> — 라운드 중 사망하면 라운드가 끝날 때까지 관전하고, 마지막 한 명이 승리합니다. 혼자면 워밍업(상대 대기)이고, 2명이

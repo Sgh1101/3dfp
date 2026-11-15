@@ -102,6 +102,47 @@ export function createAudio() {
       tone(1400, 0.05, { gain: 0.18, type: 'square' });
     },
 
+    /** 머리 명중 — 일반 히트마커보다 높은 이중음 */
+    headshot() {
+      tone(1900, 0.045, { gain: 0.2, type: 'square' });
+      tone(2400, 0.05, { gain: 0.14, type: 'square', delay: 0.045 });
+    },
+
+    /** 점프(발을 떼는 짧은 숨/발소리) */
+    jump() {
+      noise(0.07, { gain: 0.12, type: 'highpass', freq: 1400 });
+      tone(320, 0.08, { gain: 0.07, type: 'triangle', slideTo: 480 });
+    },
+
+    /** 착지 — 낙하 속도에 따라 세진다 */
+    land(speed = 6) {
+      const g = Math.min(0.34, 0.1 + speed * 0.018);
+      noise(0.13, { gain: g, type: 'lowpass', freq: 420 });
+      tone(90, 0.12, { gain: g * 0.6, type: 'sine', slideTo: 55 });
+    },
+
+    /** 정조준 진입/해제 */
+    adsIn() {
+      noise(0.05, { gain: 0.09, type: 'bandpass', freq: 2200, q: 2 });
+      tone(700, 0.05, { gain: 0.05, type: 'sine' });
+    },
+
+    adsOut() {
+      noise(0.05, { gain: 0.07, type: 'bandpass', freq: 1600, q: 2 });
+    },
+
+    /** 보급 획득 */
+    loot() {
+      tone(660, 0.09, { gain: 0.13, type: 'triangle' });
+      tone(880, 0.12, { gain: 0.13, type: 'triangle', delay: 0.08 });
+    },
+
+    /** 킬 확정 배너 */
+    killConfirm(head = false) {
+      tone(head ? 1200 : 980, 0.12, { gain: 0.16, type: 'triangle' });
+      tone(head ? 1800 : 1320, 0.16, { gain: 0.13, type: 'triangle', delay: 0.1 });
+    },
+
     kill() {
       tone(900, 0.08, { gain: 0.2, type: 'square' });
       tone(1350, 0.1, { gain: 0.18, type: 'square', delay: 0.07 });
